@@ -1,0 +1,2342 @@
+From d44ea49a3a3168a8d4cf08ca1cf12ed983ee872f Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Tue, 27 Mar 2018 15:16:56 +0000
+Subject: [PATCH 01/20] Expose send rate and receive rate in BandwidthSampler
+ class
+
+---
+ net/quic/core/congestion_control/bandwidth_sampler.cc | 16 +++++++++++++++-
+ net/quic/core/congestion_control/bandwidth_sampler.h  | 12 ++++++++++++
+ 2 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/net/quic/core/congestion_control/bandwidth_sampler.cc b/net/quic/core/congestion_control/bandwidth_sampler.cc
+index d73dd92..b05569c 100644
+--- a/net/quic/core/congestion_control/bandwidth_sampler.cc
++++ b/net/quic/core/congestion_control/bandwidth_sampler.cc
+@@ -20,7 +20,9 @@ BandwidthSampler::BandwidthSampler()
+       last_sent_packet_(0),
+       is_app_limited_(false),
+       end_of_app_limited_phase_(0),
+-      connection_state_map_() {}
++      connection_state_map_(),
++      send_rate_(QuicBandwidth::Zero()),
++      ack_rate_(QuicBandwidth::Zero()) {}
+ 
+ BandwidthSampler::~BandwidthSampler() {}
+ 
+@@ -130,6 +132,10 @@ BandwidthSample BandwidthSampler::OnPacketAcknowledgedInner(
+           sent_packet.total_bytes_acked_at_the_last_acked_packet,
+       ack_time - sent_packet.last_acked_packet_ack_time);
+ 
++  // update inner send and receive rate
++  send_rate_ = send_rate;
++  ack_rate_ = ack_rate;
++
+   BandwidthSample sample;
+   sample.bandwidth = std::min(send_rate, ack_rate);
+   // Note: this sample does not account for delayed acknowledgement time.  This
+@@ -173,4 +179,12 @@ QuicPacketNumber BandwidthSampler::end_of_app_limited_phase() const {
+   return end_of_app_limited_phase_;
+ }
+ 
++QuicBandwidth BandwidthSampler::GetAckRate() {
++  return ack_rate_;
++}
++
++QuicBandwidth BandwidthSampler::GetSendRate() {
++  return send_rate_;
++}
++
+ }  // namespace net
+diff --git a/net/quic/core/congestion_control/bandwidth_sampler.h b/net/quic/core/congestion_control/bandwidth_sampler.h
+index 4255e61..ac97dea 100644
+--- a/net/quic/core/congestion_control/bandwidth_sampler.h
++++ b/net/quic/core/congestion_control/bandwidth_sampler.h
+@@ -78,6 +78,8 @@ class QUIC_EXPORT_PRIVATE BandwidthSamplerInterface {
+   // Application-limited information exported for debugging.
+   virtual bool is_app_limited() const = 0;
+   virtual QuicPacketNumber end_of_app_limited_phase() const = 0;
++  virtual QuicBandwidth GetAckRate() = 0;
++  virtual QuicBandwidth GetSendRate() = 0;
+ };
+ 
+ // BandwidthSampler keeps track of sent and acknowledged packets and outputs a
+@@ -182,6 +184,9 @@ class QUIC_EXPORT_PRIVATE BandwidthSampler : public BandwidthSamplerInterface {
+   bool is_app_limited() const override;
+   QuicPacketNumber end_of_app_limited_phase() const override;
+ 
++ QuicBandwidth GetAckRate() override;
++  QuicBandwidth GetSendRate() override;
++
+  private:
+   friend class test::BandwidthSamplerPeer;
+ 
+@@ -281,6 +286,13 @@ class QUIC_EXPORT_PRIVATE BandwidthSampler : public BandwidthSamplerInterface {
+   // sent, indexed by the packet number.
+   PacketNumberIndexedQueue<ConnectionStateOnSentPacket> connection_state_map_;
+ 
++  // Keep track of the current send rate and receive rate, to expose
++  // Send rate
++  QuicBandwidth send_rate_;
++
++  // Receive rate
++  QuicBandwidth ack_rate_;
++
+   // Handles the actual bandwidth calculations, whereas the outer method handles
+   // retrieving and removing |sent_packet|.
+   BandwidthSample OnPacketAcknowledgedInner(
+-- 
+2.7.4
+
+
+From 1da00ecd40ab4d25c5ca617c477cc644e033a3ad Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Tue, 27 Mar 2018 18:05:14 +0000
+Subject: [PATCH 02/20] Add functions to send algorithm interface for setting
+ the rate or congestion window
+
+---
+ net/quic/core/congestion_control/send_algorithm_interface.cc |  6 ++++++
+ net/quic/core/congestion_control/send_algorithm_interface.h  | 10 ++++++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/net/quic/core/congestion_control/send_algorithm_interface.cc b/net/quic/core/congestion_control/send_algorithm_interface.cc
+index a912005..40e94e3 100644
+--- a/net/quic/core/congestion_control/send_algorithm_interface.cc
++++ b/net/quic/core/congestion_control/send_algorithm_interface.cc
+@@ -52,4 +52,10 @@ SendAlgorithmInterface* SendAlgorithmInterface::Create(
+   return nullptr;
+ }
+ 
++void SendAlgorithmInterface::SetCwnd(uint32_t cwnd) {}
++
++void SendAlgorithmInterface::SetRateAbs(uint32_t rate) {}
++
++void SendAlgorithmInterface::SetRateRel(uint32_t rate_factor) {}
++
+ }  // namespace net
+diff --git a/net/quic/core/congestion_control/send_algorithm_interface.h b/net/quic/core/congestion_control/send_algorithm_interface.h
+index 3b68b9e..7ff96e4 100644
+--- a/net/quic/core/congestion_control/send_algorithm_interface.h
++++ b/net/quic/core/congestion_control/send_algorithm_interface.h
+@@ -133,6 +133,16 @@ class QUIC_EXPORT_PRIVATE SendAlgorithmInterface {
+   // such cases, it should use the internal state it uses for congestion control
+   // for that.
+   virtual void OnApplicationLimited(QuicByteCount bytes_in_flight) = 0;
++
++  // Setters used by CCP Sender; default implementation is {}
++  // Set the Cwnd (in bytes)
++  virtual void SetCwnd(uint32_t cwnd);
++
++  // Set the rate (in bytes per second)
++  virtual void SetRateAbs(uint32_t rate);
++
++  // Set the rate relative to the current rate
++  virtual void SetRateRel(uint32_t rate_factor);
+ };
+ 
+ }  // namespace net
+-- 
+2.7.4
+
+
+From 3ed1e3841727c74eb28202aa68a6205cea873d4f Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Tue, 27 Mar 2018 19:12:14 +0000
+Subject: [PATCH 03/20] Add new CCP Sender object
+
+---
+ net/BUILD.gn                                       |   2 +
+ net/quic/core/congestion_control/ccp_sender.cc     | 107 +++++++++++++++++++++
+ net/quic/core/congestion_control/ccp_sender.h      | 107 +++++++++++++++++++++
+ .../congestion_control/send_algorithm_interface.cc |   3 +
+ net/quic/core/quic_types.h                         |   2 +-
+ 5 files changed, 220 insertions(+), 1 deletion(-)
+ create mode 100644 net/quic/core/congestion_control/ccp_sender.cc
+ create mode 100644 net/quic/core/congestion_control/ccp_sender.h
+
+diff --git a/net/BUILD.gn b/net/BUILD.gn
+index 52320b9..6c83a26 100644
+--- a/net/BUILD.gn
++++ b/net/BUILD.gn
+@@ -1147,6 +1147,8 @@ component("net") {
+       "quic/core/congestion_control/bandwidth_sampler.h",
+       "quic/core/congestion_control/bbr_sender.cc",
+       "quic/core/congestion_control/bbr_sender.h",
++      "quic/core/congestion_control/ccp_sender.cc",
++      "quic/core/congestion_control/ccp_sender.h",
+       "quic/core/congestion_control/cubic_bytes.cc",
+       "quic/core/congestion_control/cubic_bytes.h",
+       "quic/core/congestion_control/general_loss_algorithm.cc",
+diff --git a/net/quic/core/congestion_control/ccp_sender.cc b/net/quic/core/congestion_control/ccp_sender.cc
+new file mode 100644
+index 0000000..89775b8
+--- /dev/null
++++ b/net/quic/core/congestion_control/ccp_sender.cc
+@@ -0,0 +1,107 @@
++// CCP Quic Sender
++
++#include <algorithm>
++
++#include "net/quic/core/congestion_control/ccp_sender.h"
++#include "net/quic/core/congestion_control/rtt_stats.h"
++
++namespace net {
++CCPSender::CCPSender(const RttStats* rtt_stats, const QuicUnackedPacketMap* unacked_packets)
++    :    rtt_stats_(rtt_stats),
++         unacked_packets_(unacked_packets),
++         congestion_window_(10*kDefaultTCPMSS),
++         pacing_rate_(QuicBandwidth::Zero())
++    {}
++
++CCPSender::~CCPSender() {}
++
++void CCPSender::OnConnectionMigration() {}
++
++void CCPSender::OnCongestionEvent(bool rtt_updated,
++			                      QuicByteCount prior_in_flight,
++                                  QuicTime event_time,
++                                  const AckedPacketVector& acked_packets,
++                                  const LostPacketVector& lost_packets) {
++
++  if (rtt_updated) {
++    QUIC_DLOG(ERROR) << "min rtt: " << rtt_stats_->min_rtt();
++    QUIC_DLOG(ERROR) << "least unacked: " << unacked_packets_->GetLeastUnacked();
++  }
++}
++
++void CCPSender::OnPacketSent(QuicTime sent_time,
++				             QuicByteCount bytes_in_flight,
++                             QuicPacketNumber packet_number,
++                             QuicByteCount bytes,
++                             HasRetransmittableData is_retransmittable) {
++}
++
++void CCPSender::OnRetransmissionTimeout(bool packets_retransmitted) { 
++
++}
++
++// Even if this returns true, sending can be delayed due to pacing
++bool CCPSender::CanSend(QuicByteCount bytes_in_flight) {
++  return (bytes_in_flight < congestion_window_);
++}
++
++QuicBandwidth CCPSender::PacingRate(QuicByteCount bytes_in_flight) const {
++  return pacing_rate_;
++}
++
++QuicBandwidth CCPSender::BandwidthEstimate() const {
++  return QuicBandwidth::Zero();
++}
++
++QuicByteCount CCPSender::GetCongestionWindow() const {
++  return congestion_window_;
++}
++
++bool CCPSender::InSlowStart() const {
++  return false;
++}
++
++bool CCPSender::InRecovery() const {
++  return false;
++}
++
++bool CCPSender::IsProbingForMoreBandwidth() const {
++  return false;
++}
++
++QuicByteCount CCPSender::GetSlowStartThreshold() const {
++  return 0;
++}
++
++CongestionControlType CCPSender::GetCongestionControlType() const {
++  return kCCP;
++}
++
++void CCPSender::AdjustNetworkParameters(QuicBandwidth bandwidth,
++                                        QuicTime::Delta rtt) {
++}
++
++std::string CCPSender::GetDebugState() const {
++  return "";
++}
++
++void CCPSender::SetCwnd(uint32_t cwnd) {
++  QuicByteCount cwnd_bytes = (QuicByteCount)cwnd;
++  congestion_window_ = cwnd_bytes;
++}
++
++void CCPSender::SetRateAbs(uint32_t rate) {
++  pacing_rate_ = QuicBandwidth::FromBytesPerSecond((uint64_t)rate);
++}
++
++void CCPSender::SetRateRel(uint32_t rate_factor) {
++  uint64_t current_rate = (uint64_t)(pacing_rate_.ToBytesPerSecond());
++  uint64_t new_rate = current_rate * (uint64_t)rate_factor;
++  pacing_rate_ = QuicBandwidth::FromBytesPerSecond(new_rate/100); // factor is *100
++}
++
++} // namespace net
++
++
++
++
+diff --git a/net/quic/core/congestion_control/ccp_sender.h b/net/quic/core/congestion_control/ccp_sender.h
+new file mode 100644
+index 0000000..8165cd4
+--- /dev/null
++++ b/net/quic/core/congestion_control/ccp_sender.h
+@@ -0,0 +1,107 @@
++// CCP Quic Sender
++
++#ifndef NET_QUIC_CORE_CONGESTION_CONTROL_CCP_SENDER_H_
++#define NET_QUIC_CORE_CONGESTION_CONTROL_CCP_SENDER_H_
++
++#include <cstdint>
++#include <cstdio>
++#include <thread>
++#include <iostream>
++#include <sys/socket.h>
++#include "base/compiler_specific.h"
++#include "base/macros.h"
++#include "net/quic/core/congestion_control/bandwidth_sampler.h"
++#include "net/quic/core/congestion_control/hybrid_slow_start.h"
++#include "net/quic/core/congestion_control/prr_sender.h"
++#include "net/quic/core/congestion_control/send_algorithm_interface.h"
++#include "net/quic/core/quic_bandwidth.h"
++#include "net/quic/core/quic_connection_stats.h"
++#include "net/quic/core/quic_packets.h"
++#include "net/quic/core/quic_time.h"
++#include "net/quic/platform/api/quic_export.h"
++#include <iostream>
++#include <fstream>
++
++namespace net {
++using namespace std;
++typedef int (*ccp_invoke_function)(struct ccp_connection*);
++namespace test {
++    class CCPSender;
++}
++
++class RttStats;
++
++class QUIC_EXPORT_PRIVATE CCPSender : public SendAlgorithmInterface {
++  public:
++    CCPSender(const RttStats* rtt_stats, const QuicUnackedPacketMap* unacked_packets);
++
++    ~CCPSender() override;
++
++    // Functions in send_algorithm_interface by default
++    void SetFromConfig(const QuicConfig& config, Perspective perspective) override {}
++    
++    void SetNumEmulatedConnections(int num_connections) override {}
++    
++    void OnConnectionMigration() override;
++    
++    void OnCongestionEvent(bool rtt_updated,
++				QuicByteCount prior_in_flight,
++                                QuicTime event_time,
++                                const AckedPacketVector& acked_packets,
++                                const LostPacketVector& lost_packets) override;
++    
++    void OnPacketSent(QuicTime sent_time,
++				QuicByteCount bytes_in_flight,
++                            	QuicPacketNumber packet_number,
++                            	QuicByteCount bytes,
++                            	HasRetransmittableData is_retransmittable) override;
++    
++    void OnRetransmissionTimeout(bool packets_retransmitted) override;
++   
++    bool CanSend(QuicByteCount bytes_in_flight) override;
++   
++    QuicBandwidth PacingRate(QuicByteCount bytes_in_flight) const override;
++    
++    QuicBandwidth BandwidthEstimate() const override;
++    
++    QuicByteCount GetCongestionWindow() const override;
++    
++    bool InSlowStart() const override;
++   
++    bool InRecovery() const override;
++    
++    bool IsProbingForMoreBandwidth() const override;
++    
++    QuicByteCount GetSlowStartThreshold() const override;
++    
++    CongestionControlType GetCongestionControlType() const override;
++    
++    void AdjustNetworkParameters(QuicBandwidth bandwidth,
++                                       QuicTime::Delta rtt) override;
++    
++    std::string GetDebugState() const override; 
++    
++    void OnApplicationLimited(QuicByteCount bytes_in_flight) override {}
++
++    // Extra functions added to send_algorithm_interface for CCP
++    void SetCwnd(uint32_t cwnd) override;
++
++    void SetRateAbs(uint32_t rate) override;
++
++    void SetRateRel(uint32_t factor) override;
++
++  private:
++    const RttStats* rtt_stats_; // maintain RTT updates
++    
++    const QuicUnackedPacketMap* unacked_packets_; // maintain pointer to map of unacked packets
++    
++    QuicByteCount congestion_window_; // current congestion window in bytes
++    
++    QuicBandwidth pacing_rate_; // current pacing rate in bytes per second
++
++};
++} // namespace net
++
++#endif //NET_QUIC_CORE_CONGESTION_CONTROL_TCP_CUBIC_SENDER_BASE_H
++
++
+diff --git a/net/quic/core/congestion_control/send_algorithm_interface.cc b/net/quic/core/congestion_control/send_algorithm_interface.cc
+index 40e94e3..be34dd0 100644
+--- a/net/quic/core/congestion_control/send_algorithm_interface.cc
++++ b/net/quic/core/congestion_control/send_algorithm_interface.cc
+@@ -5,6 +5,7 @@
+ #include "net/quic/core/congestion_control/send_algorithm_interface.h"
+ 
+ #include "net/quic/core/congestion_control/bbr_sender.h"
++#include "net/quic/core/congestion_control/ccp_sender.h"
+ #include "net/quic/core/congestion_control/tcp_cubic_sender_bytes.h"
+ #include "net/quic/core/quic_packets.h"
+ #include "net/quic/platform/api/quic_bug_tracker.h"
+@@ -48,6 +49,8 @@ SendAlgorithmInterface* SendAlgorithmInterface::Create(
+       return new TcpCubicSenderBytes(clock, rtt_stats, true /* use Reno */,
+                                      initial_congestion_window,
+                                      max_congestion_window, stats);
++    case kCCP:
++      return new CCPSender(rtt_stats, unacked_packets);
+   }
+   return nullptr;
+ }
+diff --git a/net/quic/core/quic_types.h b/net/quic/core/quic_types.h
+index 9671b45..989a333 100644
+--- a/net/quic/core/quic_types.h
++++ b/net/quic/core/quic_types.h
+@@ -271,7 +271,7 @@ enum QuicPacketPrivateFlags {
+ // QUIC. Note that this is separate from the congestion feedback type -
+ // some congestion control algorithms may use the same feedback type
+ // (Reno and Cubic are the classic example for that).
+-enum CongestionControlType { kCubicBytes, kRenoBytes, kBBR, kPCC };
++enum CongestionControlType { kCubicBytes, kRenoBytes, kBBR, kPCC, kCCP };
+ 
+ enum LossDetectionType {
+   kNack,          // Used to mimic TCP's loss detection.
+-- 
+2.7.4
+
+
+From 3385642e591e317a6c41e82157865b672c9c08d5 Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Thu, 29 Mar 2018 04:06:48 +0000
+Subject: [PATCH 04/20] Add libccp into net/BUILD.gn as third_party lib.
+
+For this to work, libccp must be cloned into src/third_party and should
+include a BUILD.gn specifying the compilation flag.
+---
+ net/BUILD.gn | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/net/BUILD.gn b/net/BUILD.gn
+index 6c83a26..b6b2741 100644
+--- a/net/BUILD.gn
++++ b/net/BUILD.gn
+@@ -1817,6 +1817,7 @@ component("net") {
+     deps += [
+       "//base/third_party/dynamic_annotations",
+       "//third_party/zlib",
++      "//third_party/libccp",
+     ]
+ 
+     if (enable_reporting) {
+@@ -3346,6 +3347,7 @@ source_set("simple_quic_tools") {
+     "//base",
+     "//base/third_party/dynamic_annotations",
+     "//url",
++    "//third_party/libccp"
+   ]
+ }
+ 
+-- 
+2.7.4
+
+
+From d01723fd0c584312488b3428db51a9ce4fc7d23f Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Thu, 29 Mar 2018 19:02:20 +0000
+Subject: [PATCH 05/20] Add GetCCPIndex() and SetCCPConnection() to
+ SendAlgorithmInterface.
+
+This commit adds two functions to the SendAlgorithmInterface -- for
+specific use by the CCPSender object, and includes the libccp ccp
+header file now included in the 3rd party library. A default
+implementation returns -1 for GetCCPIndex() and does nothing for
+SetCCPConnection() in send_algorithm_interface.cc.
+---
+ net/quic/core/congestion_control/send_algorithm_interface.cc |  6 ++++++
+ net/quic/core/congestion_control/send_algorithm_interface.h  | 10 ++++++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/net/quic/core/congestion_control/send_algorithm_interface.cc b/net/quic/core/congestion_control/send_algorithm_interface.cc
+index be34dd0..771140f 100644
+--- a/net/quic/core/congestion_control/send_algorithm_interface.cc
++++ b/net/quic/core/congestion_control/send_algorithm_interface.cc
+@@ -61,4 +61,10 @@ void SendAlgorithmInterface::SetRateAbs(uint32_t rate) {}
+ 
+ void SendAlgorithmInterface::SetRateRel(uint32_t rate_factor) {}
+ 
++void SendAlgorithmInterface::SetCCPConnection(struct ccp_connection* conn) {}
++
++int SendAlgorithmInterface::GetCCPIndex() {
++  return -1;
++}
++
+ }  // namespace net
+diff --git a/net/quic/core/congestion_control/send_algorithm_interface.h b/net/quic/core/congestion_control/send_algorithm_interface.h
+index 7ff96e4..d6c4a72 100644
+--- a/net/quic/core/congestion_control/send_algorithm_interface.h
++++ b/net/quic/core/congestion_control/send_algorithm_interface.h
+@@ -22,6 +22,10 @@
+ #include "net/quic/platform/api/quic_export.h"
+ #include "net/quic/platform/api/quic_string.h"
+ 
++extern "C" {
++#include "third_party/libccp/ccp.h"
++}
++
+ namespace net {
+ 
+ class CachedNetworkParameters;
+@@ -143,6 +147,12 @@ class QUIC_EXPORT_PRIVATE SendAlgorithmInterface {
+ 
+   // Set the rate relative to the current rate
+   virtual void SetRateRel(uint32_t rate_factor);
++
++  // Set pointer to CCPConnection object; for updating primitives per ack
++  virtual void SetCCPConnection(struct ccp_connection* conn);
++
++  // Return the CCP connection ID
++  virtual int GetCCPIndex();
+ };
+ 
+ }  // namespace net
+-- 
+2.7.4
+
+
+From 1f56f215334b66722acd3aafa0c17f9265f4ce80 Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Thu, 29 Mar 2018 19:05:34 +0000
+Subject: [PATCH 06/20] Modify CCPSender to follow libccp API
+
+This commit modify the CCPSender class in ccp_sender.{cc,h} to include
+the libccp headers and follow the datapath API by (a) updating the
+congestion signal primitives per ack and (b) triggering ccp_invoke on
+every congestion event. It also adds the extra functions in
+SendAlgorithmInterface to get the CCP index or set the pointer to the
+ccp_connection object.
+---
+ net/quic/core/congestion_control/ccp_sender.cc | 117 +++++++++++++++++++++++--
+ net/quic/core/congestion_control/ccp_sender.h  |  43 ++++++---
+ 2 files changed, 142 insertions(+), 18 deletions(-)
+
+diff --git a/net/quic/core/congestion_control/ccp_sender.cc b/net/quic/core/congestion_control/ccp_sender.cc
+index 89775b8..b40665b 100644
+--- a/net/quic/core/congestion_control/ccp_sender.cc
++++ b/net/quic/core/congestion_control/ccp_sender.cc
+@@ -10,34 +10,121 @@ CCPSender::CCPSender(const RttStats* rtt_stats, const QuicUnackedPacketMap* unac
+     :    rtt_stats_(rtt_stats),
+          unacked_packets_(unacked_packets),
+          congestion_window_(10*kDefaultTCPMSS),
+-         pacing_rate_(QuicBandwidth::Zero())
++         pacing_rate_(QuicBandwidth::Zero()),
++         send_rate_(QuicBandwidth::Zero()),
++         ack_rate_(QuicBandwidth::Zero()),
++         sampler_(new BandwidthSampler()),
++         conn_()
+     {}
+ 
+ CCPSender::~CCPSender() {}
+ 
+-void CCPSender::OnConnectionMigration() {}
++void CCPSender::OnConnectionMigration() {
++  congestion_window_ = 10*kDefaultTCPMSS;
++  pacing_rate_ = QuicBandwidth::Zero();
++}
+ 
+ void CCPSender::OnCongestionEvent(bool rtt_updated,
+-			                      QuicByteCount prior_in_flight,
++                            QuicByteCount prior_in_flight,
+                                   QuicTime event_time,
+                                   const AckedPacketVector& acked_packets,
+                                   const LostPacketVector& lost_packets) {
+ 
+-  if (rtt_updated) {
+-    QUIC_DLOG(ERROR) << "min rtt: " << rtt_stats_->min_rtt();
+-    QUIC_DLOG(ERROR) << "least unacked: " << unacked_packets_->GetLeastUnacked();
+-  }
++  UpdateRateEstimate(event_time, acked_packets, lost_packets);
++
++  UpdateCCPPrimitives(rtt_updated, prior_in_flight, event_time, acked_packets, lost_packets);
++
++  ccp_invoke(conn_);
++
++  sampler_->RemoveObsoletePackets(unacked_packets_->GetLeastUnacked());
+ }
+ 
+ void CCPSender::OnPacketSent(QuicTime sent_time,
+-				             QuicByteCount bytes_in_flight,
++                     QuicByteCount bytes_in_flight,
+                              QuicPacketNumber packet_number,
+                              QuicByteCount bytes,
+                              HasRetransmittableData is_retransmittable) {
++  // update the bandwidth sampler
++  sampler_->OnPacketSent(sent_time, packet_number, bytes, bytes_in_flight, is_retransmittable);
++  conn_->prims.bytes_in_flight = bytes_in_flight;
+ }
+ 
+ void CCPSender::OnRetransmissionTimeout(bool packets_retransmitted) { 
++  conn_->prims.was_timeout = packets_retransmitted;
++}
++
++void CCPSender::UpdateRateEstimate(QuicTime event_time,
++                                   const AckedPacketVector& acked_packets,
++                                   const LostPacketVector& lost_packets) {
++  for (const LostPacket lost_packet: lost_packets) {
++    sampler_->OnPacketLost(lost_packet.packet_number);
++  }
++
++  for (const AckedPacket acked_packet: acked_packets) {
++    sampler_->OnPacketAcknowledged(event_time, acked_packet.packet_number);
++  }
+ 
++  ack_rate_ = sampler_->GetAckRate();
++  send_rate_ = sampler_->GetSendRate();
++}
++
++
++void CCPSender::UpdateCCPPrimitives(bool rtt_updated,
++                                     QuicByteCount prior_in_flight,
++                                     QuicTime event_time,
++                                     const AckedPacketVector& acked_packets,
++                                     const LostPacketVector& lost_packets) {
++  // reset bytes and packets acked and misordered
++  conn_->prims.packets_acked = 0;
++  conn_->prims.bytes_acked = 0;
++  conn_->prims.packets_misordered = 0;
++  conn_->prims.bytes_misordered = 0;
++  conn_->prims.lost_pkts_sample = 0;
++
++  // update RTT if rtt was updated
++  if (rtt_updated) {
++    QuicTime::Delta rtt = rtt_stats_->latest_rtt();
++    conn_->prims.rtt_sample_us = (uint64_t)(rtt.ToMicroseconds());
++  }
++
++  // get the minimum lost packet
++  QuicPacketNumber min_lost_packet = 0;
++  bool count_as_in_order = true; // TRUE UNTIL REACHING THE FIRST LOST PACKET
++  for (const LostPacket lost_packet : lost_packets ) {
++    if ((lost_packet.packet_number < min_lost_packet) || (min_lost_packet==0)) {
++      min_lost_packet = lost_packet.packet_number;
++    }
++  }
++
++  // bytes and packets acked, and misordered
++  for (const AckedPacket acked_packet : acked_packets) {
++    // start counting out of order if there are lost packets and ack passes min lost packet
++    if ((lost_packets.size() > 0) && (acked_packet.packet_number > min_lost_packet)) {
++      count_as_in_order = false;
++    }
++
++    if (count_as_in_order) {
++      conn_->prims.packets_acked += 1;
++      conn_->prims.bytes_acked += acked_packet.bytes_acked;
++    } else { // past first lost packet, start counting as misordered
++      conn_->prims.packets_misordered += 1;
++      conn_->prims.bytes_misordered += acked_packet.bytes_acked;
++    }
++  }
++
++  // lost packets
++  conn_->prims.lost_pkts_sample = lost_packets.size();
++
++  conn_->prims.packets_in_flight = (uint64_t)((conn_->prims.bytes_in_flight)/(double(kDefaultTCPMSS)));
++
++  // get current congestion window in bytes
++  conn_->prims.snd_cwnd = congestion_window_;
++
++  // current pacing rate
++  conn_->prims.snd_rate = pacing_rate_.ToBytesPerSecond();
++
++  conn_->prims.rate_outgoing = (uint64_t)(send_rate_.ToBytesPerSecond());
++  conn_->prims.rate_incoming = (uint64_t)(ack_rate_.ToBytesPerSecond());
+ }
+ 
+ // Even if this returns true, sending can be delayed due to pacing
+@@ -79,6 +166,12 @@ CongestionControlType CCPSender::GetCongestionControlType() const {
+ 
+ void CCPSender::AdjustNetworkParameters(QuicBandwidth bandwidth,
+                                         QuicTime::Delta rtt) {
++  if (!(rtt.IsZero())) {
++    conn_->prims.rtt_sample_us = (uint64_t)(rtt.ToMicroseconds());
++  }
++  
++  conn_->prims.rate_outgoing = (uint64_t)(send_rate_.ToBytesPerSecond());
++  conn_->prims.rate_incoming = (uint64_t)(ack_rate_.ToBytesPerSecond());
+ }
+ 
+ std::string CCPSender::GetDebugState() const {
+@@ -100,6 +193,14 @@ void CCPSender::SetRateRel(uint32_t rate_factor) {
+   pacing_rate_ = QuicBandwidth::FromBytesPerSecond(new_rate/100); // factor is *100
+ }
+ 
++void CCPSender::SetCCPConnection(struct ccp_connection* conn) {
++  conn_ = conn;
++}
++
++int CCPSender::GetCCPIndex() {
++  return conn_->index;
++}
++
+ } // namespace net
+ 
+ 
+diff --git a/net/quic/core/congestion_control/ccp_sender.h b/net/quic/core/congestion_control/ccp_sender.h
+index 8165cd4..b20fc81 100644
+--- a/net/quic/core/congestion_control/ccp_sender.h
++++ b/net/quic/core/congestion_control/ccp_sender.h
+@@ -24,7 +24,6 @@
+ 
+ namespace net {
+ using namespace std;
+-typedef int (*ccp_invoke_function)(struct ccp_connection*);
+ namespace test {
+     class CCPSender;
+ }
+@@ -45,16 +44,16 @@ class QUIC_EXPORT_PRIVATE CCPSender : public SendAlgorithmInterface {
+     void OnConnectionMigration() override;
+     
+     void OnCongestionEvent(bool rtt_updated,
+-				QuicByteCount prior_in_flight,
+-                                QuicTime event_time,
+-                                const AckedPacketVector& acked_packets,
+-                                const LostPacketVector& lost_packets) override;
++			               QuicByteCount prior_in_flight,
++                           QuicTime event_time,
++                           const AckedPacketVector& acked_packets,
++                           const LostPacketVector& lost_packets) override;
+     
+     void OnPacketSent(QuicTime sent_time,
+-				QuicByteCount bytes_in_flight,
+-                            	QuicPacketNumber packet_number,
+-                            	QuicByteCount bytes,
+-                            	HasRetransmittableData is_retransmittable) override;
++				      QuicByteCount bytes_in_flight,
++                      QuicPacketNumber packet_number,
++                      QuicByteCount bytes,
++                      HasRetransmittableData is_retransmittable) override;
+     
+     void OnRetransmissionTimeout(bool packets_retransmitted) override;
+    
+@@ -88,9 +87,25 @@ class QUIC_EXPORT_PRIVATE CCPSender : public SendAlgorithmInterface {
+ 
+     void SetRateAbs(uint32_t rate) override;
+ 
+-    void SetRateRel(uint32_t factor) override;
++    void SetRateRel(uint32_t rate_factor) override;
++
++    void SetCCPConnection(struct ccp_connection* conn) override;
++
++    int GetCCPIndex() override;
+ 
+   private:
++    // updates all congestion primitives for CCP
++    void UpdateCCPPrimitives(bool rtt_updated,
++                             QuicByteCount prior_in_flight,
++                             QuicTime event_time,
++                             const AckedPacketVector& acked_packets,
++                             const LostPacketVector& lost_packets);
++
++    // uses the bandwidth sampler to update the rate estimate
++    void UpdateRateEstimate(QuicTime event_time,
++                            const AckedPacketVector& acked_packets,
++                            const LostPacketVector& lost_packets);
++
+     const RttStats* rtt_stats_; // maintain RTT updates
+     
+     const QuicUnackedPacketMap* unacked_packets_; // maintain pointer to map of unacked packets
+@@ -99,6 +114,14 @@ class QUIC_EXPORT_PRIVATE CCPSender : public SendAlgorithmInterface {
+     
+     QuicBandwidth pacing_rate_; // current pacing rate in bytes per second
+ 
++    QuicBandwidth send_rate_; // latest send rate
++    
++    QuicBandwidth ack_rate_; // latest receive rate
++    
++    std::unique_ptr<BandwidthSamplerInterface> sampler_; // bandwidth sampler to measure rates
++    
++    struct ccp_connection* conn_; // pointer to ccp_connection object; includes primitives
++
+ };
+ } // namespace net
+ 
+-- 
+2.7.4
+
+
+From a22911c9b20376d9990643faa4442d3d9c2c7d83 Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Thu, 29 Mar 2018 19:08:28 +0000
+Subject: [PATCH 07/20] Modify QuicSentPacketManager class to add CCP functions
+
+This commit adds function to quic_sent_packet_manager.{cc,h} to set the
+congestion window and pacing rate, set the pointer to the ccp connection
+object and get the ccp index, in the underlying sender object.
+---
+ net/quic/core/quic_sent_packet_manager.cc | 20 ++++++++++++++++++++
+ net/quic/core/quic_sent_packet_manager.h  | 11 +++++++++++
+ 2 files changed, 31 insertions(+)
+
+diff --git a/net/quic/core/quic_sent_packet_manager.cc b/net/quic/core/quic_sent_packet_manager.cc
+index 3fded66..4929136 100644
+--- a/net/quic/core/quic_sent_packet_manager.cc
++++ b/net/quic/core/quic_sent_packet_manager.cc
+@@ -1222,6 +1222,26 @@ void QuicSentPacketManager::SetSessionNotifier(
+   unacked_packets_.SetSessionNotifier(session_notifier);
+ }
+ 
++void QuicSentPacketManager::SetCwnd(uint32_t cwnd) {
++  send_algorithm_->SetCwnd(cwnd);
++}
++
++void QuicSentPacketManager::SetRateAbs(uint32_t rate) {
++  send_algorithm_->SetRateAbs(rate);
++}
++
++void QuicSentPacketManager::SetRateRel(uint32_t rate_factor) {
++  send_algorithm_->SetRateRel(rate_factor);
++}
++
++void QuicSentPacketManager::SetCCPConnection(struct ccp_connection* conn) {
++  send_algorithm_->SetCCPConnection(conn);
++}
++
++int QuicSentPacketManager::GetCCPIndex() {
++  return send_algorithm_->GetCCPIndex();
++}
++
+ void QuicSentPacketManager::SetInitialRtt(QuicTime::Delta rtt) {
+   const QuicTime::Delta min_rtt =
+       QuicTime::Delta::FromMicroseconds(kMinInitialRoundTripTimeUs);
+diff --git a/net/quic/core/quic_sent_packet_manager.h b/net/quic/core/quic_sent_packet_manager.h
+index 7713a67..eeb1b52 100644
+--- a/net/quic/core/quic_sent_packet_manager.h
++++ b/net/quic/core/quic_sent_packet_manager.h
+@@ -259,6 +259,17 @@ class QUIC_EXPORT_PRIVATE QuicSentPacketManager {
+ 
+   void SetSessionNotifier(SessionNotifierInterface* session_notifier);
+ 
++  // Setters for CCP Sending Algorithm
++  void SetCwnd(uint32_t cwnd);
++
++  void SetRateAbs(uint32_t rate);
++
++  void SetRateRel(uint32_t rate_factor);
++
++  void SetCCPConnection(struct ccp_connection* conn);
++
++  int GetCCPIndex();
++
+   QuicPacketCount initial_congestion_window() const {
+     return initial_congestion_window_;
+   }
+-- 
+2.7.4
+
+
+From 005b782fcee3f3d2ded1be0198b3f053e89a26a6 Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Thu, 29 Mar 2018 19:14:17 +0000
+Subject: [PATCH 08/20] Modify QuicConnection to include CCP functions
+
+This commit adds functions to QuicConnection in quic_connection.{cc,h}
+to set the congestion window and pacing rate, the pointer to the
+ccp_connection object and get the CCP index in the underlying sender.
+It also calls ccp_connection_free when tearing down the local connection state.
+---
+ net/quic/core/quic_connection.cc | 31 ++++++++++++++++++++++++++++++-
+ net/quic/core/quic_connection.h  | 15 +++++++++++++++
+ 2 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/net/quic/core/quic_connection.cc b/net/quic/core/quic_connection.cc
+index c464ac7..7a442a0 100644
+--- a/net/quic/core/quic_connection.cc
++++ b/net/quic/core/quic_connection.cc
+@@ -319,7 +319,8 @@ QuicConnection::QuicConnection(
+           quic_handle_write_results_for_connectivity_probe)),
+       use_path_degrading_alarm_(
+           GetQuicReloadableFlag(quic_path_degrading_alarm)),
+-      enable_server_proxy_(GetQuicReloadableFlag(quic_enable_server_proxy)) {
++      enable_server_proxy_(GetQuicReloadableFlag(quic_enable_server_proxy)),
++      use_ccp_(false) {
+   QUIC_DLOG(INFO) << ENDPOINT
+                   << "Created connection with connection_id: " << connection_id
+                   << " and version: "
+@@ -2471,6 +2472,14 @@ void QuicConnection::TearDownLocalConnectionState(
+   // Cancel the alarms so they don't trigger any action now that the
+   // connection is closed.
+   CancelAllAlarms();
++
++  // If connection uses ccp, free ccp memory using ccp_close_handler pointer
++  if (use_ccp_) {
++    int ccp_index = sent_packet_manager_.GetCCPIndex();
++    if (ccp_index != -1) {
++      ccp_connection_free((uint16_t)ccp_index);
++    }
++  }
+ }
+ 
+ void QuicConnection::CancelAllAlarms() {
+@@ -3226,6 +3235,26 @@ void QuicConnection::PostProcessAfterAckFrame(bool send_stop_waiting,
+   }
+ }
+ 
++void QuicConnection::SetCwnd(uint32_t cwnd) {
++  sent_packet_manager_.SetCwnd(cwnd);
++}
++
++void QuicConnection::SetRateAbs(uint32_t rate) {
++  sent_packet_manager_.SetRateAbs(rate);
++}
++
++void QuicConnection::SetRateRel(uint32_t rate_factor) {
++  sent_packet_manager_.SetRateRel(rate_factor);
++}
++
++void QuicConnection::SetCCPConnection(struct ccp_connection* conn) {
++  sent_packet_manager_.SetCCPConnection(conn);
++}
++
++void QuicConnection::SetCCP(bool ccp) {
++  use_ccp_ = ccp;
++}
++
+ void QuicConnection::SetSessionNotifier(
+     SessionNotifierInterface* session_notifier) {
+   sent_packet_manager_.SetSessionNotifier(session_notifier);
+diff --git a/net/quic/core/quic_connection.h b/net/quic/core/quic_connection.h
+index 3c854a6..e747d01 100644
+--- a/net/quic/core/quic_connection.h
++++ b/net/quic/core/quic_connection.h
+@@ -531,6 +531,18 @@ class QUIC_EXPORT_PRIVATE QuicConnection
+   void set_creator_debug_delegate(QuicPacketCreator::DebugDelegate* visitor) {
+     packet_generator_.set_debug_delegate(visitor);
+   }
++
++  // CCP setter functions
++  void SetCwnd(uint32_t cwnd);
++
++  void SetRateAbs(uint32_t rate);
++
++  void SetRateRel(uint32_t rate_factor);
++
++  void SetCCPConnection(struct ccp_connection* conn);
++
++  void SetCCP(bool ccp);
++
+   const QuicSocketAddress& self_address() const { return self_address_; }
+   const QuicSocketAddress& peer_address() const {
+     if (enable_server_proxy_) {
+@@ -1309,6 +1321,9 @@ class QUIC_EXPORT_PRIVATE QuicConnection
+ 
+   // Latched value of quic_reloadable_flag_quic_enable_server_proxy.
+   const bool enable_server_proxy_;
++  
++  // If true, connection is using CCP as congestion control sending algorithm
++  bool use_ccp_;
+ 
+   DISALLOW_COPY_AND_ASSIGN(QuicConnection);
+ };
+-- 
+2.7.4
+
+
+From 7cd28a969c16069899c2ffbef6d1e3a42fc6acf6 Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Thu, 29 Mar 2018 19:19:12 +0000
+Subject: [PATCH 09/20] Add quic_ccp_connection_handler.{cc,h} in
+ net/tools/quic
+
+This commit adds a new class, QuicCCPConnectionHandler, that handles
+setting up CCP state per connection and implementing the CCP datapath
+API. It sets up communication with the userspace CCP module through UDP
+sockets to and from /tmp/ccp/0/{out,in}. It also provides the libccp API
+function (declared as static) to set the window or rate for a particular
+function, provide a notion of time, and send a message through IPC. Upon
+reading a message, it invokes the ccp_read_msg function in libccp to
+trigger the correct callback.
+---
+ net/BUILD.gn                                  |   2 +
+ net/tools/quic/quic_ccp_connection_handler.cc | 223 ++++++++++++++++++++++++++
+ net/tools/quic/quic_ccp_connection_handler.h  |  89 ++++++++++
+ 3 files changed, 314 insertions(+)
+ create mode 100644 net/tools/quic/quic_ccp_connection_handler.cc
+ create mode 100644 net/tools/quic/quic_ccp_connection_handler.h
+
+diff --git a/net/BUILD.gn b/net/BUILD.gn
+index b6b2741..0286fc9 100644
+--- a/net/BUILD.gn
++++ b/net/BUILD.gn
+@@ -3298,6 +3298,8 @@ source_set("simple_quic_tools") {
+   sources = [
+     "tools/quic/chlo_extractor.cc",
+     "tools/quic/chlo_extractor.h",
++    "tools/quic/quic_ccp_connection_handler.cc",
++    "tools/quic/quic_ccp_connection_handler.h",
+     "tools/quic/quic_client_base.cc",
+     "tools/quic/quic_client_base.h",
+     "tools/quic/quic_client_message_loop_network_helper.cc",
+diff --git a/net/tools/quic/quic_ccp_connection_handler.cc b/net/tools/quic/quic_ccp_connection_handler.cc
+new file mode 100644
+index 0000000..66913b8
+--- /dev/null
++++ b/net/tools/quic/quic_ccp_connection_handler.cc
+@@ -0,0 +1,223 @@
++// QUIC CCP Connection Handler
++// Sets up Unix Socket with userspace CCP agent to manage communication
++// Exposes functions that implement the libccp datapath API
++
++#include "net/tools/quic/quic_ccp_connection_handler.h"
++
++namespace net {
++
++QuicCCPConnectionHandler::QuicCCPConnectionHandler(bool uses_ccp)
++  :  uses_ccp_(uses_ccp),
++     recv_sock_(0),
++     send_sock_(0),
++     stop_thread_(false),
++     recv_thread_(),
++     dp_() {
++  if (uses_ccp_) {
++    int ok = SetupSockets();
++    if (ok < 0) {
++      QUIC_DLOG(ERROR) << "Not ok";
++      exit(-1);
++    }
++  }      
++}
++
++QuicCCPConnectionHandler::~QuicCCPConnectionHandler() {
++  if (uses_ccp_) {
++    ccp_free(); // free memory to store CCP state
++    // close the sending and receiving socket
++    close(recv_sock_);
++    close(send_sock_);
++  }
++}
++
++// setup global start time
++int64_t QuicCCPConnectionHandler::global_start = ( base::Time::Now() - base::Time::UnixEpoch() ).InMicroseconds();
++
++int QuicCCPConnectionHandler::SetupSockets() {
++  struct sockaddr_un recv_sockaddr, send_sockaddr;
++  int path_len = 0;
++  // receiving socket
++  if ((recv_sock_ = socket(AF_UNIX, SOCK_DGRAM, 0)) == -1) {
++    QUIC_DLOG(ERROR) << "Setting up recv socket for CCP failed";
++    return -1;
++  }
++
++  recv_sockaddr.sun_family = AF_UNIX;
++  strcpy(recv_sockaddr.sun_path, FROM_CCP_SOCKET);
++  unlink(recv_sockaddr.sun_path);
++  path_len = strlen(recv_sockaddr.sun_path) + sizeof(recv_sockaddr.sun_family);
++  if ((bind(recv_sock_, reinterpret_cast<sockaddr*>(&recv_sockaddr), path_len)) < 0) {
++    QUIC_DLOG(ERROR) << "Binding recv socket to " << FROM_CCP_SOCKET << " failed";
++    QUIC_DLOG(ERROR) << "error: " << strerror(errno);
++    return -1;
++  }
++
++  // set up sending socket
++  if ((send_sock_ = socket(AF_UNIX, SOCK_DGRAM, 0)) == -1) {
++    QUIC_DLOG(ERROR) << "Setting up send socket for CCP failed";
++    return -1;
++  }
++
++  send_sockaddr.sun_family = AF_UNIX;
++  strcpy(send_sockaddr.sun_path, TO_CCP_SOCKET);
++  path_len = strlen(send_sockaddr.sun_path) + sizeof(send_sockaddr.sun_family);
++  if ((connect(send_sock_, reinterpret_cast<sockaddr*>(&send_sockaddr), path_len)) < 0) {
++    QUIC_DLOG(ERROR) << "err: " << strerror(errno);
++    QUIC_DLOG(ERROR) << "Binding send socket to " << TO_CCP_SOCKET << " failed";
++    return -1;
++  }
++  unlink(send_sockaddr.sun_path);
++
++  return 0;
++}
++
++// spawn parallel thread for listening
++void QuicCCPConnectionHandler::StartListeningThread() {
++  if (!uses_ccp_) {
++    return;
++  }
++
++  recv_thread_ = new std::thread(&QuicCCPConnectionHandler::ListenForMessages, this);
++}
++
++// stop the listening thread
++void QuicCCPConnectionHandler::StopListeningThread() {
++  if (!uses_ccp_) {
++    return;
++  }
++  stop_thread_ = false;
++  recv_thread_->join();
++}
++
++// loop while waiting for messages
++void QuicCCPConnectionHandler::ListenForMessages() {
++  while (!stop_thread_) {
++    int ok;
++    char recvBuf[BIGGEST_MSG_SIZE];
++    int bytes_rcvd = recvfrom(recv_sock_, recvBuf, BIGGEST_MSG_SIZE, 0, NULL, NULL);
++    if (bytes_rcvd > 0) {
++      ok = ccp_read_msg((char*)recvBuf, bytes_rcvd);
++      if (ok < 0) {
++        QUIC_DLOG(ERROR) << "CCP message read failed: " << ok;
++        QUIC_DLOG(ERROR) << "error: " << strerror(errno);
++      }
++    }
++  }
++}
++
++// Libccp uses this to send messages up to userspace CCP
++int QuicCCPConnectionHandler::SendMsg(struct ccp_datapath *dp, struct ccp_connection *conn, char *msg, int msg_size) {
++  struct socket_info *sk_info = (struct socket_info*)dp->impl;
++  if (send(sk_info->send_sock, msg, (uint8_t)msg_size, 0) < 0) {
++    QUIC_DLOG(ERROR) << "Failed to send msg to ccp";
++    QUIC_DLOG(ERROR) << "error: " << strerror(errno);
++    return -1;
++  }
++  return 0;
++}
++
++
++// Class that owns this class calls this to have libccp allocate memory
++// only used when uses_ccp_ is true
++// Sets up libccp API function pointers
++void QuicCCPConnectionHandler::InitCCP() {
++  uint64_t start_microseconds = (uint64_t)(global_start);
++
++  // initialize all fields in dp
++  dp_.set_cwnd = &(QuicCCPConnectionHandler::SetCwnd);
++  dp_.set_rate_abs = &(QuicCCPConnectionHandler::SetRateAbs);
++  dp_.set_rate_rel = &(QuicCCPConnectionHandler::SetRateRel);
++  dp_.send_msg = &(QuicCCPConnectionHandler::SendMsg);
++  dp_.time_zero = start_microseconds; /* convert start to microseconds */
++  dp_.now = &(QuicCCPConnectionHandler::Now);
++  dp_.since_usecs = &(QuicCCPConnectionHandler::SinceUsecs);
++  dp_.after_usecs = &(QuicCCPConnectionHandler::AfterUsecs);
++
++  // add pointer to socket info
++  struct socket_info sk_info = {
++    .send_sock = send_sock_,
++    .recv_sock = recv_sock_
++  };
++
++  dp_.impl = (void*)&sk_info;
++
++  int ok = ccp_init(&dp_);
++  if (ok < 0) {
++    QUIC_DLOG(ERROR) << "CCP_init function failed";
++    exit(-1);
++  }
++}
++
++// Upon starting a connection, setup CCP state
++void QuicCCPConnectionHandler::StartFlow(QuicConnection *connection, const QuicSocketAddress& client_address, QuicConnectionId connection_id) {
++  struct ccp_connection* ccp_conn;
++  uint32_t connection_id32 = (uint32_t)(connection_id >> 32);
++
++  struct ccp_datapath_info dp_info = {
++    .init_cwnd = kDefaultTCPMSS*10,
++    .mss = kDefaultTCPMSS,
++    .src_ip = connection_id32, // Replacement for scr ip and port is QUIC connection ID
++    .src_port = 0,
++    .dst_ip = (uint32_t)(client_address.host().AddressFamilyToInt()),
++    .dst_port = (uint32_t)(client_address.port()),
++    .congAlg = "reno",
++  };
++
++  ccp_conn = ccp_connection_start( (void*)connection, &dp_info);
++  if ( ccp_conn == NULL ) {
++    QUIC_DLOG(ERROR) << "Conn start failed";
++  }
++
++  // Set connection's ccp flag
++  connection->SetCCP(true);
++
++  // Set the pointer to the ccp_conn object
++  connection->SetCCPConnection(ccp_conn);
++
++}
++
++// Set cwnd for a particular connection in bytes
++void QuicCCPConnectionHandler::SetCwnd(struct ccp_datapath *dp, struct ccp_connection *conn, uint32_t cwnd) {
++  QuicConnection *connection = (QuicConnection*)(conn->impl);
++  connection->SetCwnd(cwnd);
++}
++
++// Set rate
++void QuicCCPConnectionHandler::SetRateAbs(struct ccp_datapath *dp, struct ccp_connection *conn, uint32_t rate) {
++  QuicConnection *connection = (QuicConnection*)(conn->impl);
++  connection->SetRateAbs(rate);
++}
++
++// Set rate factor
++void QuicCCPConnectionHandler::SetRateRel(struct ccp_datapath *dp, struct ccp_connection *conn, uint32_t rate_factor) {
++  QuicConnection *connection = (QuicConnection*)(conn->impl);
++  connection->SetRateRel(rate_factor);
++}
++
++// Now, datapath units
++uint64_t QuicCCPConnectionHandler::Now() {
++  int64_t real_now = (base::Time::Now() - base::Time::UnixEpoch()).InMicroseconds();
++  return (uint64_t)(real_now - global_start);
++}
++
++// Time since then
++uint64_t QuicCCPConnectionHandler::SinceUsecs(uint64_t then) {
++  int64_t real_now = (base::Time::Now() - base::Time::UnixEpoch()).InMicroseconds();
++  int64_t now = real_now - global_start;
++  int64_t since = now  - (int64_t)then;
++  return (uint64_t)since;
++}
++
++// Time usecs from now
++uint64_t QuicCCPConnectionHandler::AfterUsecs(uint64_t usecs) {
++  int64_t real_now = (base::Time::Now() - base::Time::UnixEpoch()).InMicroseconds();
++  int64_t now = real_now - global_start;
++  int64_t after = (int64_t)usecs + now;
++  return (uint64_t)after;
++}
++
++
++
++
++} // namespace net
+diff --git a/net/tools/quic/quic_ccp_connection_handler.h b/net/tools/quic/quic_ccp_connection_handler.h
+new file mode 100644
+index 0000000..ed0cdb8
+--- /dev/null
++++ b/net/tools/quic/quic_ccp_connection_handler.h
+@@ -0,0 +1,89 @@
++// QUIC CCP Connection Handler
++// Sets up Unix Socket with userspace CCP agent to manage communication
++// Exposes functions that implement the libccp datapath API
++
++#ifndef NET_TOOLS_QUIC_QUIC_CCP_CONNECTION_HANDLER_H_
++#define NET_TOOLS_QUIC_QUIC_CCP_CONNECTION_HANDLER_H_
++
++#include <sys/un.h>
++#include <sys/socket.h>
++#include <thread>
++#include "net/quic/core/quic_connection.h"
++#include "base/time/time.h"
++#include "net/quic/platform/api/quic_logging.h"
++extern "C" {
++#include "third_party/libccp/serialize.h"
++#include "third_party/libccp/ccp.h"
++}
++
++namespace net {
++#define FROM_CCP_SOCKET "/tmp/ccp/0/out"
++#define TO_CCP_SOCKET "/tmp/ccp/0/in"
++
++class QuicConnection;
++
++// stores the IPC socket info for use in static function SendMsg
++struct socket_info {
++  int send_sock;
++  int recv_sock;
++};
++
++class QuicCCPConnectionHandler{
++  public:
++    QuicCCPConnectionHandler(bool uses_ccp);
++    
++    ~QuicCCPConnectionHandler();
++    
++    // start for timer
++    static int64_t global_start;
++
++    // Spawn thread to listen for messages from Userspace CCP
++    void StartListeningThread();
++
++    // On destruction, stop the parallel thread
++    void StopListeningThread();
++
++    // Listens to messages from userspace ccp and calls into libccp to handle them
++    void ListenForMessages();
++
++    // Initializes libccp to allocate memory
++    void InitCCP();
++
++    // Called to setup flow state for every connection
++    void StartFlow(QuicConnection *connection, const QuicSocketAddress& client_address, QuicConnectionId connection_id);
++
++    // Libccp API functions
++    static void SetCwnd(struct ccp_datapath *dp, struct ccp_connection *conn, uint32_t cwnd);
++
++    static void SetRateAbs(struct ccp_datapath *dp, struct ccp_connection *conn, uint32_t rate);
++
++    static void SetRateRel(struct ccp_datapath *dp, struct ccp_connection *conn, uint32_t rate_factor);
++
++    static int SendMsg(struct ccp_datapath *dp, struct ccp_connection *conn, char *msg, int msg_size);
++
++    static uint64_t Now(); // current time in datapath units
++
++    static uint64_t SinceUsecs(uint64_t then); // time since then
++
++    static uint64_t AfterUsecs(uint64_t usecs); // time usecs after now
++
++  private:
++    int SetupSockets(); // socket initialization
++
++    bool uses_ccp_;
++    
++    int recv_sock_; // listening for messages from userspace ccp
++    
++    int send_sock_; // sending messages to userspace ccp
++    
++    bool stop_thread_; // used to kill the receiving thread
++   
++    std::thread* recv_thread_; // listen for messages in a separate thread
++
++    struct ccp_datapath dp_; // datapath object sent on initialization
++
++
++
++};
++} // namespace net
++#endif // NET_TOOLS_QUIC_QUIC_CCP_CONNECTION_HANDLER_H
+-- 
+2.7.4
+
+
+From 0732b025893fc5ef06c914e1e5ee548358220b22 Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Thu, 29 Mar 2018 20:28:11 +0000
+Subject: [PATCH 10/20] Add --congestion_control= flag to simple server.
+
+This commit modifies the toy server binary to require passing in a type
+of congestion control. The default is cubic (if the string name does not
+match a real CC name).
+---
+ net/quic/core/quic_flags_list.h          |  9 +++++++++
+ net/tools/quic/quic_simple_server.cc     | 32 ++++++++++++++++++++++++++++++++
+ net/tools/quic/quic_simple_server.h      |  5 +++++
+ net/tools/quic/quic_simple_server_bin.cc | 23 ++++++++++++++++++++++-
+ 4 files changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/net/quic/core/quic_flags_list.h b/net/quic/core/quic_flags_list.h
+index 53e9fc6..5a2a1d4 100644
+--- a/net/quic/core/quic_flags_list.h
++++ b/net/quic/core/quic_flags_list.h
+@@ -83,6 +83,15 @@ QUIC_FLAG(bool, FLAGS_quic_reloadable_flag_quic_enable_pcc, false)
+ // When true, defaults to BBR congestion control instead of Cubic.
+ QUIC_FLAG(bool, FLAGS_quic_reloadable_flag_quic_default_to_bbr, false)
+ 
++// If true, enable experiment for testing CCP congestion control
++QUIC_FLAG(bool, FLAGS_quic_reloadable_flag_quic_enable_ccp, false)
++
++// If true, enable experiment for testing Reno congestion control
++QUIC_FLAG(bool, FLAGS_quic_reloadable_flag_quic_enable_reno, false)
++
++// If true, enable experiment for testing Cubic congestion control (default)
++QUIC_FLAG(bool, FLAGS_quic_reloadable_flag_quic_enable_cubic, true)
++
+ // Allow a new rate based recovery in QUIC BBR to be enabled via connection
+ // option.
+ QUIC_FLAG(bool, FLAGS_quic_reloadable_flag_quic_bbr_rate_recovery, false)
+diff --git a/net/tools/quic/quic_simple_server.cc b/net/tools/quic/quic_simple_server.cc
+index 6526e6c..fa4f3a6 100644
+--- a/net/tools/quic/quic_simple_server.cc
++++ b/net/tools/quic/quic_simple_server.cc
+@@ -213,4 +213,36 @@ void QuicSimpleServer::OnReadComplete(int result) {
+   StartReading();
+ }
+ 
++// Sets the Quic flags associated with each congestion control type
++//  For safety, makes the other types false
++void QuicSimpleServer::SetCongestionControlType(enum CongestionControlType cc_type) {
++    // set all flags to false temporarily
++  SetQuicFlag(&FLAGS_quic_reloadable_flag_quic_default_to_bbr, false);
++  SetQuicFlag(&FLAGS_quic_reloadable_flag_quic_enable_ccp, false);
++  SetQuicFlag(&FLAGS_quic_reloadable_flag_quic_enable_cubic, false);
++  SetQuicFlag(&FLAGS_quic_reloadable_flag_quic_enable_pcc, false);
++  SetQuicFlag(&FLAGS_quic_reloadable_flag_quic_enable_reno, false);
++
++  switch (cc_type) {
++      case net::kBBR:
++          SetQuicFlag(&FLAGS_quic_reloadable_flag_quic_default_to_bbr, true);
++          break;
++      case net::kCCP:
++          SetQuicFlag(&FLAGS_quic_reloadable_flag_quic_enable_ccp, true);
++          break;
++      case net::kCubicBytes:
++          SetQuicFlag(&FLAGS_quic_reloadable_flag_quic_enable_cubic, true);
++          break;
++      case net::kPCC:
++          SetQuicFlag(&FLAGS_quic_reloadable_flag_quic_enable_pcc, true);
++          break;
++      case net::kRenoBytes:
++          SetQuicFlag(&FLAGS_quic_reloadable_flag_quic_enable_reno, true);
++          break;
++      default:
++          SetQuicFlag(&FLAGS_quic_reloadable_flag_quic_enable_cubic, true);
++          break;
++    }
++}
++
+ }  // namespace net
+diff --git a/net/tools/quic/quic_simple_server.h b/net/tools/quic/quic_simple_server.h
+index b72d967..8275e8c 100644
+--- a/net/tools/quic/quic_simple_server.h
++++ b/net/tools/quic/quic_simple_server.h
+@@ -21,6 +21,8 @@
+ #include "net/quic/core/quic_version_manager.h"
+ #include "net/quic/platform/impl/quic_chromium_clock.h"
+ #include "net/tools/quic/quic_http_response_cache.h"
++#include "net/quic/core/quic_types.h"
++#include "net/quic/platform/api/quic_flags.h"
+ 
+ namespace net {
+ 
+@@ -62,6 +64,9 @@ class QuicSimpleServer {
+ 
+   IPEndPoint server_address() const { return server_address_; }
+ 
++  // Configure congestion control on server
++  void SetCongestionControlType(enum CongestionControlType cc_type);
++
+  private:
+   friend class test::QuicSimpleServerPeer;
+ 
+diff --git a/net/tools/quic/quic_simple_server_bin.cc b/net/tools/quic/quic_simple_server_bin.cc
+index e7c44d2..0cdd337 100644
+--- a/net/tools/quic/quic_simple_server_bin.cc
++++ b/net/tools/quic/quic_simple_server_bin.cc
+@@ -55,7 +55,8 @@ int main(int argc, char* argv[]) {
+         "--quic_response_cache_dir  directory containing response data\n"
+         "                            to load\n"
+         "--certificate_file=<file>   path to the certificate chain\n"
+-        "--key_file=<file>           path to the pkcs8 private key\n";
++        "--key_file=<file>           path to the pkcs8 private key\n"
++        "--congestion_control type of congestion control: ccp, bbr, reno, pcc, or cubic\n";
+     std::cout << help_str;
+     exit(0);
+   }
+@@ -83,6 +84,11 @@ int main(int argc, char* argv[]) {
+     return 1;
+   }
+ 
++  if (!line->HasSwitch("congestion_control")) {
++    LOG(ERROR) << "missing --congestion_control";
++    return 1;
++  }
++
+   net::IPAddress ip = net::IPAddress::IPv6AllZeros();
+ 
+   net::QuicConfig config;
+@@ -92,6 +98,21 @@ int main(int argc, char* argv[]) {
+       config, net::QuicCryptoServerConfig::ConfigOptions(),
+       net::AllSupportedVersions(), &response_cache);
+ 
++  // set congestion control based on command line options
++  std::string cc_type = line->GetSwitchValueASCII("congestion_control");
++  LOG(ERROR) << "CC: " << cc_type;
++  if (cc_type == "bbr") {
++    server.SetCongestionControlType(net::kBBR);
++  } else if (cc_type == "ccp") {
++    server.SetCongestionControlType(net::kCCP);
++  } else if (cc_type == "cubic") {
++    server.SetCongestionControlType(net::kCubicBytes);
++  } else if (cc_type  == "reno") {
++    server.SetCongestionControlType(net::kRenoBytes);
++  } else if (cc_type == "pcc") {
++    server.SetCongestionControlType(net::kPCC);
++  }
++
+   int rc = server.Listen(net::IPEndPoint(ip, FLAGS_port));
+   if (rc < 0) {
+     return 1;
+-- 
+2.7.4
+
+
+From 4e9a373e213e88cea57a7e8ade9dd953332c2f32 Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Thu, 29 Mar 2018 20:39:59 +0000
+Subject: [PATCH 11/20] Modify QuicConnection to use configurable congestion
+ control
+
+This commit modifies QuicConnection, when setting up the
+SentPacketManager object, to select the currently configured congestion
+according to the reloadable flags; and log whichever algorithm it is.
+---
+ net/quic/core/congestion_control/send_algorithm_interface.cc | 1 +
+ net/quic/core/quic_connection.cc                             | 2 +-
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/net/quic/core/congestion_control/send_algorithm_interface.cc b/net/quic/core/congestion_control/send_algorithm_interface.cc
+index 771140f..1ce2ecc 100644
+--- a/net/quic/core/congestion_control/send_algorithm_interface.cc
++++ b/net/quic/core/congestion_control/send_algorithm_interface.cc
+@@ -27,6 +27,7 @@ SendAlgorithmInterface* SendAlgorithmInterface::Create(
+     QuicRandom* random,
+     QuicConnectionStats* stats,
+     QuicPacketCount initial_congestion_window) {
++  QUIC_DLOG(ERROR) << "Congestion control type: " << congestion_control_type;
+   QuicPacketCount max_congestion_window = kDefaultMaxCongestionWindowPackets;
+   switch (congestion_control_type) {
+     case kBBR:
+diff --git a/net/quic/core/quic_connection.cc b/net/quic/core/quic_connection.cc
+index 7a442a0..da61d2b 100644
+--- a/net/quic/core/quic_connection.cc
++++ b/net/quic/core/quic_connection.cc
+@@ -294,7 +294,7 @@ QuicConnection::QuicConnection(
+           perspective,
+           clock_,
+           &stats_,
+-          GetQuicReloadableFlag(quic_default_to_bbr) ? kBBR : kCubicBytes,
++          GetQuicFlag(FLAGS_quic_reloadable_flag_quic_default_to_bbr) ? kBBR : GetQuicFlag(FLAGS_quic_reloadable_flag_quic_enable_ccp) ? kCCP : GetQuicFlag(FLAGS_quic_reloadable_flag_quic_enable_pcc) ? kPCC : GetQuicFlag(FLAGS_quic_reloadable_flag_quic_enable_reno) ? kRenoBytes : kCubicBytes,
+           kNack),
+       version_negotiation_state_(START_NEGOTIATION),
+       perspective_(perspective),
+-- 
+2.7.4
+
+
+From fa78729e601d91b11f0d090769e0b692b7087ddb Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Thu, 29 Mar 2018 21:01:53 +0000
+Subject: [PATCH 12/20] Modify SimpleDispatcher to use CCP if flag enabled
+
+This commit modifies the QuicSimpleDispatcher, used in the toy server,
+to create a QuicCCPConnectionHandler, and perform the proper
+initialization and destruction for the IPC and setting up libccp. Per
+connection, it calls "StartFlow".
+---
+ net/tools/quic/quic_simple_dispatcher.cc | 16 ++++++++++++++--
+ net/tools/quic/quic_simple_dispatcher.h  |  5 +++++
+ 2 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/net/tools/quic/quic_simple_dispatcher.cc b/net/tools/quic/quic_simple_dispatcher.cc
+index 1f64cb5..0968292 100644
+--- a/net/tools/quic/quic_simple_dispatcher.cc
++++ b/net/tools/quic/quic_simple_dispatcher.cc
+@@ -22,9 +22,17 @@ QuicSimpleDispatcher::QuicSimpleDispatcher(
+                      std::move(helper),
+                      std::move(session_helper),
+                      std::move(alarm_factory)),
+-      response_cache_(response_cache) {}
++      response_cache_(response_cache),
++      ccp_connection_handler_(GetQuicFlag(FLAGS_quic_reloadable_flag_quic_enable_ccp)) {
++        if (GetQuicFlag(FLAGS_quic_reloadable_flag_quic_enable_ccp)) {
++          ccp_connection_handler_.StartListeningThread();
++          ccp_connection_handler_.InitCCP();
++        }
++      }
+ 
+-QuicSimpleDispatcher::~QuicSimpleDispatcher() = default;
++QuicSimpleDispatcher::~QuicSimpleDispatcher() {
++  ccp_connection_handler_.StopListeningThread();
++}
+ 
+ int QuicSimpleDispatcher::GetRstErrorCount(
+     QuicRstStreamErrorCode error_code) const {
+@@ -56,6 +64,10 @@ QuicServerSessionBase* QuicSimpleDispatcher::CreateQuicSession(
+       CreatePerConnectionWriter(),
+       /* owns_writer= */ true, Perspective::IS_SERVER, GetSupportedVersions());
+ 
++  if (GetQuicFlag(FLAGS_quic_reloadable_flag_quic_enable_ccp)) {
++    ccp_connection_handler_.StartFlow(connection, client_address, connection_id);
++  }
++
+   QuicServerSessionBase* session = new QuicSimpleServerSession(
+       config(), connection, this, session_helper(), crypto_config(),
+       compressed_certs_cache(), response_cache_);
+diff --git a/net/tools/quic/quic_simple_dispatcher.h b/net/tools/quic/quic_simple_dispatcher.h
+index 04e1252..41e55b2 100644
+--- a/net/tools/quic/quic_simple_dispatcher.h
++++ b/net/tools/quic/quic_simple_dispatcher.h
+@@ -8,6 +8,7 @@
+ #include "net/quic/core/quic_server_session_base.h"
+ #include "net/tools/quic/quic_dispatcher.h"
+ #include "net/tools/quic/quic_http_response_cache.h"
++#include "net/tools/quic/quic_ccp_connection_handler.h"
+ 
+ namespace net {
+ 
+@@ -41,6 +42,10 @@ class QuicSimpleDispatcher : public QuicDispatcher {
+ 
+   // The map of the reset error code with its counter.
+   std::map<QuicRstStreamErrorCode, int> rst_error_map_;
++
++  // CCP Connection Handler -- only used if the enable_ccp flag is set
++  QuicCCPConnectionHandler ccp_connection_handler_;
++
+ };
+ 
+ }  // namespace net
+-- 
+2.7.4
+
+
+From 4b23760cc4090e441541eae8b9f96f96dfbb3928 Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Thu, 29 Mar 2018 21:32:27 +0000
+Subject: [PATCH 13/20] Compile issue with namespace of ::bind
+
+---
+ net/tools/quic/quic_ccp_connection_handler.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/net/tools/quic/quic_ccp_connection_handler.cc b/net/tools/quic/quic_ccp_connection_handler.cc
+index 66913b8..26883f6 100644
+--- a/net/tools/quic/quic_ccp_connection_handler.cc
++++ b/net/tools/quic/quic_ccp_connection_handler.cc
+@@ -47,7 +47,7 @@ int QuicCCPConnectionHandler::SetupSockets() {
+   strcpy(recv_sockaddr.sun_path, FROM_CCP_SOCKET);
+   unlink(recv_sockaddr.sun_path);
+   path_len = strlen(recv_sockaddr.sun_path) + sizeof(recv_sockaddr.sun_family);
+-  if ((bind(recv_sock_, reinterpret_cast<sockaddr*>(&recv_sockaddr), path_len)) < 0) {
++  if ((::bind(recv_sock_, reinterpret_cast<sockaddr*>(&recv_sockaddr), path_len)) < 0) {
+     QUIC_DLOG(ERROR) << "Binding recv socket to " << FROM_CCP_SOCKET << " failed";
+     QUIC_DLOG(ERROR) << "error: " << strerror(errno);
+     return -1;
+-- 
+2.7.4
+
+
+From 6f87437bb952fc24d020a384d66586bec937279f Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Thu, 29 Mar 2018 21:32:58 +0000
+Subject: [PATCH 14/20] Add new congestion control logging class
+
+Add new class, spawned per connection, to log congestion windows to a
+file per connection. For testing purposes.
+---
+ net/BUILD.gn                                    |  2 +
+ net/quic/core/quic_congestion_control_logger.cc | 66 +++++++++++++++++++++++++
+ net/quic/core/quic_congestion_control_logger.h  | 40 +++++++++++++++
+ 3 files changed, 108 insertions(+)
+ create mode 100644 net/quic/core/quic_congestion_control_logger.cc
+ create mode 100644 net/quic/core/quic_congestion_control_logger.h
+
+diff --git a/net/BUILD.gn b/net/BUILD.gn
+index 0286fc9..c17fef7 100644
+--- a/net/BUILD.gn
++++ b/net/BUILD.gn
+@@ -1300,6 +1300,8 @@ component("net") {
+       "quic/core/quic_client_push_promise_index.h",
+       "quic/core/quic_config.cc",
+       "quic/core/quic_config.h",
++      "quic/core/quic_congestion_control_logger.cc",
++      "quic/core/quic_congestion_control_logger.h",
+       "quic/core/quic_connection.cc",
+       "quic/core/quic_connection.h",
+       "quic/core/quic_connection_close_delegate_interface.h",
+diff --git a/net/quic/core/quic_congestion_control_logger.cc b/net/quic/core/quic_congestion_control_logger.cc
+new file mode 100644
+index 0000000..ee62fb3
+--- /dev/null
++++ b/net/quic/core/quic_congestion_control_logger.cc
+@@ -0,0 +1,66 @@
++// Quic Congestion Control Logger
++
++#include "net/quic/core/quic_congestion_control_logger.h"
++namespace net {
++QuicCongestionControlLogger::QuicCongestionControlLogger(Perspective perspective, QuicSentPacketManager* sent_packet_manager, const QuicClock* clock)
++    : perspective_(perspective),
++      sent_packet_manager_(sent_packet_manager),
++      clock_(clock),
++      stop_thread_(false),
++      logging_thread_(),
++      file_handler_(),
++      file_name_("cwnd.txt"),
++      start_time_(clock_->WallNow()),
++      last_logged_(clock_->WallNow()) {
++        if (perspective_ == Perspective::IS_SERVER) {
++          file_handler_.open(file_name_);
++          file_handler_ << "time,cwnd\n";
++        }
++      }
++
++QuicCongestionControlLogger::~QuicCongestionControlLogger() {
++    if (perspective_ == Perspective::IS_SERVER) {
++        file_handler_.close();
++    }
++}
++
++int64_t QuicCongestionControlLogger::Now() {
++    QuicWallTime now = clock_->WallNow();
++    QuicTime::Delta time_delta = now.AbsoluteDifference(start_time_);
++    int64_t time_passed = time_delta.ToMilliseconds();
++    return time_passed;
++}
++
++int64_t QuicCongestionControlLogger::TimeSince(QuicWallTime then) {
++    QuicWallTime now = clock_->WallNow();
++    QuicTime::Delta time_delta = now.AbsoluteDifference(then);
++    return time_delta.ToMilliseconds();
++}
++void QuicCongestionControlLogger::StartThread() {
++    if (perspective_ == Perspective::IS_SERVER) {
++        logging_thread_ = new std::thread(&QuicCongestionControlLogger::LogCwnd, this);
++    }
++}
++
++void QuicCongestionControlLogger::StopThread() {
++    if (perspective_ == Perspective::IS_SERVER) {
++        stop_thread_ = true;
++        logging_thread_->join();
++        file_handler_.close();
++    }
++}
++
++// Uses the underlying sent packet manager to log the cwnd approximately every 10 seconds
++void QuicCongestionControlLogger::LogCwnd() {
++    while (!stop_thread_) {
++        // get the cwnd and write it to a file, and the current time
++        uint64_t cwnd = sent_packet_manager_->GetCongestionWindowInTcpMss();
++        int64_t time_passed = TimeSince(last_logged_);
++        if (time_passed > 20 ) {
++            int64_t time_now = Now();
++            file_handler_ << time_now << "," << cwnd << "\n";
++            last_logged_ = clock_->WallNow();
++        }
++    }
++}
++} // net
+diff --git a/net/quic/core/quic_congestion_control_logger.h b/net/quic/core/quic_congestion_control_logger.h
+new file mode 100644
+index 0000000..075409e
+--- /dev/null
++++ b/net/quic/core/quic_congestion_control_logger.h
+@@ -0,0 +1,40 @@
++// Quic Congestion Control Logger - used to A/B test CCP vs. other congestion control algorithms in quic
++// If logger is used inside connection, uses a separate thread to write the cwnd to a file every RTT or so
++
++#ifndef NET_TOOLS_QUIC_QUIC_CC_LOGGER_H_
++#define NET_TOOLS_QUIC_QUIC_CC_LOGGER_H_
++
++#include <thread>
++#include "net/quic/platform/api/quic_logging.h"
++#include "net/quic/core/quic_sent_packet_manager.h"
++#include <iostream>
++#include <fstream>
++#include <chrono>
++
++namespace net {
++class QuicConnection;
++using namespace std;
++class QuicCongestionControlLogger {
++    public:
++        QuicCongestionControlLogger(Perspective perspective, QuicSentPacketManager* sent_packet_manager, const QuicClock* clock);
++        ~QuicCongestionControlLogger();
++        void StartThread();
++        void StopThread();
++        void LogCwnd();
++    private:
++        Perspective perspective_;
++        QuicSentPacketManager* sent_packet_manager_;
++        const QuicClock* clock_;
++        bool stop_thread_;
++        std::thread* logging_thread_;
++        ofstream file_handler_;
++        std::string file_name_;
++        QuicWallTime start_time_;
++        QuicWallTime last_logged_;
++
++        int64_t Now();
++        int64_t TimeSince(QuicWallTime then);
++};
++}
++
++#endif // NET_TOOLS_QUIC_QUIC_CC_LOGGER_H_
+-- 
+2.7.4
+
+
+From 91c23da7af763d3f6cbe460eddb26431ec1ffb80 Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Thu, 29 Mar 2018 21:33:55 +0000
+Subject: [PATCH 15/20] Modify QuicConnection to use CongestionControlLogger
+
+Per QuicConnection, instantiate a CongestionControlLogger class that
+accesses the underlying sender to log the congestion window to a file.
+---
+ net/quic/core/quic_connection.cc | 9 ++++++++-
+ net/quic/core/quic_connection.h  | 4 ++++
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/net/quic/core/quic_connection.cc b/net/quic/core/quic_connection.cc
+index da61d2b..bc9970e 100644
+--- a/net/quic/core/quic_connection.cc
++++ b/net/quic/core/quic_connection.cc
+@@ -320,7 +320,8 @@ QuicConnection::QuicConnection(
+       use_path_degrading_alarm_(
+           GetQuicReloadableFlag(quic_path_degrading_alarm)),
+       enable_server_proxy_(GetQuicReloadableFlag(quic_enable_server_proxy)),
+-      use_ccp_(false) {
++      use_ccp_(false),
++      congestion_control_logger_(perspective, &sent_packet_manager_, helper->GetClock()) {
+   QUIC_DLOG(INFO) << ENDPOINT
+                   << "Created connection with connection_id: " << connection_id
+                   << " and version: "
+@@ -337,6 +338,8 @@ QuicConnection::QuicConnection(
+                          : kDefaultMaxPacketSize);
+   received_packet_manager_.set_max_ack_ranges(255);
+   MaybeEnableSessionDecidesWhatToWrite();
++  // start the congestion control logger
++  congestion_control_logger_.StartThread();
+ }
+ 
+ QuicConnection::~QuicConnection() {
+@@ -2473,6 +2476,9 @@ void QuicConnection::TearDownLocalConnectionState(
+   // connection is closed.
+   CancelAllAlarms();
+ 
++  // close the congestion control window logger
++  congestion_control_logger_.StopThread();
++
+   // If connection uses ccp, free ccp memory using ccp_close_handler pointer
+   if (use_ccp_) {
+     int ccp_index = sent_packet_manager_.GetCCPIndex();
+@@ -2480,6 +2486,7 @@ void QuicConnection::TearDownLocalConnectionState(
+       ccp_connection_free((uint16_t)ccp_index);
+     }
+   }
++
+ }
+ 
+ void QuicConnection::CancelAllAlarms() {
+diff --git a/net/quic/core/quic_connection.h b/net/quic/core/quic_connection.h
+index e747d01..eef084f 100644
+--- a/net/quic/core/quic_connection.h
++++ b/net/quic/core/quic_connection.h
+@@ -45,6 +45,7 @@
+ #include "net/quic/platform/api/quic_socket_address.h"
+ #include "net/quic/platform/api/quic_string.h"
+ #include "net/quic/platform/api/quic_string_piece.h"
++#include "net/quic/core/quic_congestion_control_logger.h"
+ 
+ namespace net {
+ 
+@@ -1325,6 +1326,9 @@ class QUIC_EXPORT_PRIVATE QuicConnection
+   // If true, connection is using CCP as congestion control sending algorithm
+   bool use_ccp_;
+ 
++  // Setup a congestion control logger to log the window sizes
++  QuicCongestionControlLogger congestion_control_logger_;
++
+   DISALLOW_COPY_AND_ASSIGN(QuicConnection);
+ };
+ 
+-- 
+2.7.4
+
+
+From 9e3c1665760f0c5f5f5cfdfaaeb4400036e0ad1e Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Mon, 2 Apr 2018 19:24:19 +0000
+Subject: [PATCH 16/20] Set pointer to ccp_invoke and ccp_free_connecton
+ functions
+
+Since the BUILD.gn file specifies that files in net/quic/core
+(quic_connection, send_algorithm_interface, etc.) are compiled
+separately from the simple server, dispatcher, and ccp connection
+handler, even if they both use libccp as a third party library, those
+instances of libccp will be separate (memory will be set). Therefore,
+the ccp_invoke and ccp_free_connection must be set as a pointer manually
+- so the variables in libccp will not be null when the ccp_sender tries
+to call ccp_invoke.
+---
+ net/quic/core/congestion_control/ccp_sender.cc               |  9 +++++++--
+ net/quic/core/congestion_control/ccp_sender.h                |  4 ++++
+ net/quic/core/congestion_control/send_algorithm_interface.cc |  2 ++
+ net/quic/core/congestion_control/send_algorithm_interface.h  |  5 +++++
+ net/quic/core/quic_connection.cc                             | 11 ++++++++++-
+ net/quic/core/quic_connection.h                              |  7 +++++++
+ net/quic/core/quic_sent_packet_manager.cc                    |  4 ++++
+ net/quic/core/quic_sent_packet_manager.h                     |  2 ++
+ net/tools/quic/quic_ccp_connection_handler.cc                |  6 ++++++
+ 9 files changed, 47 insertions(+), 3 deletions(-)
+
+diff --git a/net/quic/core/congestion_control/ccp_sender.cc b/net/quic/core/congestion_control/ccp_sender.cc
+index b40665b..c503d10 100644
+--- a/net/quic/core/congestion_control/ccp_sender.cc
++++ b/net/quic/core/congestion_control/ccp_sender.cc
+@@ -14,7 +14,8 @@ CCPSender::CCPSender(const RttStats* rtt_stats, const QuicUnackedPacketMap* unac
+          send_rate_(QuicBandwidth::Zero()),
+          ack_rate_(QuicBandwidth::Zero()),
+          sampler_(new BandwidthSampler()),
+-         conn_()
++         conn_(),
++         ccp_invoke_()
+     {}
+ 
+ CCPSender::~CCPSender() {}
+@@ -34,7 +35,7 @@ void CCPSender::OnCongestionEvent(bool rtt_updated,
+ 
+   UpdateCCPPrimitives(rtt_updated, prior_in_flight, event_time, acked_packets, lost_packets);
+ 
+-  ccp_invoke(conn_);
++  ccp_invoke_(conn_);
+ 
+   sampler_->RemoveObsoletePackets(unacked_packets_->GetLeastUnacked());
+ }
+@@ -201,6 +202,10 @@ int CCPSender::GetCCPIndex() {
+   return conn_->index;
+ }
+ 
++void CCPSender::SetCCPInvoke(ccp_invoke_handler handler) {
++  ccp_invoke_ = handler;
++}
++
+ } // namespace net
+ 
+ 
+diff --git a/net/quic/core/congestion_control/ccp_sender.h b/net/quic/core/congestion_control/ccp_sender.h
+index b20fc81..4056ad1 100644
+--- a/net/quic/core/congestion_control/ccp_sender.h
++++ b/net/quic/core/congestion_control/ccp_sender.h
+@@ -93,6 +93,8 @@ class QUIC_EXPORT_PRIVATE CCPSender : public SendAlgorithmInterface {
+ 
+     int GetCCPIndex() override;
+ 
++    void SetCCPInvoke(ccp_invoke_handler handler) override;
++
+   private:
+     // updates all congestion primitives for CCP
+     void UpdateCCPPrimitives(bool rtt_updated,
+@@ -122,6 +124,8 @@ class QUIC_EXPORT_PRIVATE CCPSender : public SendAlgorithmInterface {
+     
+     struct ccp_connection* conn_; // pointer to ccp_connection object; includes primitives
+ 
++    ccp_invoke_handler ccp_invoke_; // pointer to ccp invoke function to trigger libccp
++
+ };
+ } // namespace net
+ 
+diff --git a/net/quic/core/congestion_control/send_algorithm_interface.cc b/net/quic/core/congestion_control/send_algorithm_interface.cc
+index 1ce2ecc..5cf0986 100644
+--- a/net/quic/core/congestion_control/send_algorithm_interface.cc
++++ b/net/quic/core/congestion_control/send_algorithm_interface.cc
+@@ -68,4 +68,6 @@ int SendAlgorithmInterface::GetCCPIndex() {
+   return -1;
+ }
+ 
++void SendAlgorithmInterface::SetCCPInvoke(ccp_invoke_handler handler) {}
++
+ }  // namespace net
+diff --git a/net/quic/core/congestion_control/send_algorithm_interface.h b/net/quic/core/congestion_control/send_algorithm_interface.h
+index d6c4a72..b7dffc6 100644
+--- a/net/quic/core/congestion_control/send_algorithm_interface.h
++++ b/net/quic/core/congestion_control/send_algorithm_interface.h
+@@ -27,6 +27,7 @@ extern "C" {
+ }
+ 
+ namespace net {
++typedef int (*ccp_invoke_handler)(struct ccp_connection* );
+ 
+ class CachedNetworkParameters;
+ class RttStats;
+@@ -153,6 +154,10 @@ class QUIC_EXPORT_PRIVATE SendAlgorithmInterface {
+ 
+   // Return the CCP connection ID
+   virtual int GetCCPIndex();
++
++  // Set handler to ccp_invoke function
++  // As quic/core and the CCPConnectionHandler need access to the same exact instances of libccp -- with the same memory
++  virtual void SetCCPInvoke(ccp_invoke_handler handler);
+ };
+ 
+ }  // namespace net
+diff --git a/net/quic/core/quic_connection.cc b/net/quic/core/quic_connection.cc
+index bc9970e..882a278 100644
+--- a/net/quic/core/quic_connection.cc
++++ b/net/quic/core/quic_connection.cc
+@@ -321,6 +321,7 @@ QuicConnection::QuicConnection(
+           GetQuicReloadableFlag(quic_path_degrading_alarm)),
+       enable_server_proxy_(GetQuicReloadableFlag(quic_enable_server_proxy)),
+       use_ccp_(false),
++      ccp_close_conn_(),
+       congestion_control_logger_(perspective, &sent_packet_manager_, helper->GetClock()) {
+   QUIC_DLOG(INFO) << ENDPOINT
+                   << "Created connection with connection_id: " << connection_id
+@@ -2483,7 +2484,7 @@ void QuicConnection::TearDownLocalConnectionState(
+   if (use_ccp_) {
+     int ccp_index = sent_packet_manager_.GetCCPIndex();
+     if (ccp_index != -1) {
+-      ccp_connection_free((uint16_t)ccp_index);
++      ccp_close_conn_((uint16_t)ccp_index);
+     }
+   }
+ 
+@@ -3262,6 +3263,14 @@ void QuicConnection::SetCCP(bool ccp) {
+   use_ccp_ = ccp;
+ }
+ 
++void QuicConnection::SetCCPInvoke(ccp_invoke_handler handler) {
++  sent_packet_manager_.SetCCPInvoke(handler);
++}
++
++void QuicConnection::SetCCPCloseConnection(ccp_close_conn_handler handler) {
++    ccp_close_conn_ = handler;
++}
++
+ void QuicConnection::SetSessionNotifier(
+     SessionNotifierInterface* session_notifier) {
+   sent_packet_manager_.SetSessionNotifier(session_notifier);
+diff --git a/net/quic/core/quic_connection.h b/net/quic/core/quic_connection.h
+index eef084f..f154e70 100644
+--- a/net/quic/core/quic_connection.h
++++ b/net/quic/core/quic_connection.h
+@@ -544,6 +544,11 @@ class QUIC_EXPORT_PRIVATE QuicConnection
+ 
+   void SetCCP(bool ccp);
+ 
++  void SetCCPInvoke(ccp_invoke_handler handler);
++
++  typedef void (*ccp_close_conn_handler)(uint16_t);
++  void SetCCPCloseConnection(ccp_close_conn_handler handler);
++
+   const QuicSocketAddress& self_address() const { return self_address_; }
+   const QuicSocketAddress& peer_address() const {
+     if (enable_server_proxy_) {
+@@ -1326,6 +1331,8 @@ class QUIC_EXPORT_PRIVATE QuicConnection
+   // If true, connection is using CCP as congestion control sending algorithm
+   bool use_ccp_;
+ 
++  ccp_close_conn_handler ccp_close_conn_;
++
+   // Setup a congestion control logger to log the window sizes
+   QuicCongestionControlLogger congestion_control_logger_;
+ 
+diff --git a/net/quic/core/quic_sent_packet_manager.cc b/net/quic/core/quic_sent_packet_manager.cc
+index 4929136..a2502c0 100644
+--- a/net/quic/core/quic_sent_packet_manager.cc
++++ b/net/quic/core/quic_sent_packet_manager.cc
+@@ -1242,6 +1242,10 @@ int QuicSentPacketManager::GetCCPIndex() {
+   return send_algorithm_->GetCCPIndex();
+ }
+ 
++void QuicSentPacketManager::SetCCPInvoke(ccp_invoke_handler handler) {
++    send_algorithm_->SetCCPInvoke(handler);
++}
++
+ void QuicSentPacketManager::SetInitialRtt(QuicTime::Delta rtt) {
+   const QuicTime::Delta min_rtt =
+       QuicTime::Delta::FromMicroseconds(kMinInitialRoundTripTimeUs);
+diff --git a/net/quic/core/quic_sent_packet_manager.h b/net/quic/core/quic_sent_packet_manager.h
+index eeb1b52..5fbdaec 100644
+--- a/net/quic/core/quic_sent_packet_manager.h
++++ b/net/quic/core/quic_sent_packet_manager.h
+@@ -270,6 +270,8 @@ class QUIC_EXPORT_PRIVATE QuicSentPacketManager {
+ 
+   int GetCCPIndex();
+ 
++  void SetCCPInvoke(ccp_invoke_handler handler);
++
+   QuicPacketCount initial_congestion_window() const {
+     return initial_congestion_window_;
+   }
+diff --git a/net/tools/quic/quic_ccp_connection_handler.cc b/net/tools/quic/quic_ccp_connection_handler.cc
+index 26883f6..a5356d9 100644
+--- a/net/tools/quic/quic_ccp_connection_handler.cc
++++ b/net/tools/quic/quic_ccp_connection_handler.cc
+@@ -175,6 +175,12 @@ void QuicCCPConnectionHandler::StartFlow(QuicConnection *connection, const QuicS
+   // Set the pointer to the ccp_conn object
+   connection->SetCCPConnection(ccp_conn);
+ 
++  // Set pointer to ccp_invoke
++  connection->SetCCPInvoke(ccp_invoke);
++
++  // Set pointer to ccp_connection_free -> so quic connection can call it when tearing down connection state
++  connection->SetCCPCloseConnection(ccp_connection_free);
++
+ }
+ 
+ // Set cwnd for a particular connection in bytes
+-- 
+2.7.4
+
+
+From c84d0392d111f8379d85ba077e1dc1be915beaf4 Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Mon, 2 Apr 2018 19:30:28 +0000
+Subject: [PATCH 17/20] Modify how send_sock_ is accessed in
+ QuicCCPConnectionHandler
+
+This commit modifies QuicCCPConnection to include a struct that contains
+the file descriptors for the send_sock_ and recv_sock_ used for
+communication with the CCP module; this recorded in the datapath->impl
+field for access when sending a message through IPC.
+---
+ net/quic/core/congestion_control/ccp_sender.h |  4 ++--
+ net/tools/quic/quic_ccp_connection_handler.cc | 13 ++++++-------
+ net/tools/quic/quic_ccp_connection_handler.h  |  2 +-
+ 3 files changed, 9 insertions(+), 10 deletions(-)
+
+diff --git a/net/quic/core/congestion_control/ccp_sender.h b/net/quic/core/congestion_control/ccp_sender.h
+index 4056ad1..43c2653 100644
+--- a/net/quic/core/congestion_control/ccp_sender.h
++++ b/net/quic/core/congestion_control/ccp_sender.h
+@@ -40,9 +40,9 @@ class QUIC_EXPORT_PRIVATE CCPSender : public SendAlgorithmInterface {
+     void SetFromConfig(const QuicConfig& config, Perspective perspective) override {}
+     
+     void SetNumEmulatedConnections(int num_connections) override {}
+-    
++
+     void OnConnectionMigration() override;
+-    
++
+     void OnCongestionEvent(bool rtt_updated,
+ 			               QuicByteCount prior_in_flight,
+                            QuicTime event_time,
+diff --git a/net/tools/quic/quic_ccp_connection_handler.cc b/net/tools/quic/quic_ccp_connection_handler.cc
+index a5356d9..9dcdb7e 100644
+--- a/net/tools/quic/quic_ccp_connection_handler.cc
++++ b/net/tools/quic/quic_ccp_connection_handler.cc
+@@ -12,7 +12,8 @@ QuicCCPConnectionHandler::QuicCCPConnectionHandler(bool uses_ccp)
+      send_sock_(0),
+      stop_thread_(false),
+      recv_thread_(),
+-     dp_() {
++     dp_(),
++     socket_info_() {
+   if (uses_ccp_) {
+     int ok = SetupSockets();
+     if (ok < 0) {
+@@ -62,12 +63,14 @@ int QuicCCPConnectionHandler::SetupSockets() {
+   send_sockaddr.sun_family = AF_UNIX;
+   strcpy(send_sockaddr.sun_path, TO_CCP_SOCKET);
+   path_len = strlen(send_sockaddr.sun_path) + sizeof(send_sockaddr.sun_family);
+-  if ((connect(send_sock_, reinterpret_cast<sockaddr*>(&send_sockaddr), path_len)) < 0) {
++  if ((::connect(send_sock_, reinterpret_cast<sockaddr*>(&send_sockaddr), path_len)) < 0) {
+     QUIC_DLOG(ERROR) << "err: " << strerror(errno);
+     QUIC_DLOG(ERROR) << "Binding send socket to " << TO_CCP_SOCKET << " failed";
+     return -1;
+   }
+   unlink(send_sockaddr.sun_path);
++  socket_info_.send_sock = send_sock_;
++  socket_info_.recv_sock = recv_sock_;
+ 
+   return 0;
+ }
+@@ -135,12 +138,8 @@ void QuicCCPConnectionHandler::InitCCP() {
+   dp_.after_usecs = &(QuicCCPConnectionHandler::AfterUsecs);
+ 
+   // add pointer to socket info
+-  struct socket_info sk_info = {
+-    .send_sock = send_sock_,
+-    .recv_sock = recv_sock_
+-  };
+ 
+-  dp_.impl = (void*)&sk_info;
++  dp_.impl = (void*)&socket_info_;
+ 
+   int ok = ccp_init(&dp_);
+   if (ok < 0) {
+diff --git a/net/tools/quic/quic_ccp_connection_handler.h b/net/tools/quic/quic_ccp_connection_handler.h
+index ed0cdb8..e9a0139 100644
+--- a/net/tools/quic/quic_ccp_connection_handler.h
++++ b/net/tools/quic/quic_ccp_connection_handler.h
+@@ -82,7 +82,7 @@ class QuicCCPConnectionHandler{
+ 
+     struct ccp_datapath dp_; // datapath object sent on initialization
+ 
+-
++    struct socket_info socket_info_;
+ 
+ };
+ } // namespace net
+-- 
+2.7.4
+
+
+From f7616119e6496fb22458281487eacb205f7611f4 Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Tue, 17 Jul 2018 19:24:48 +0000
+Subject: [PATCH 18/20] client: add prints
+
+---
+ net/tools/quic/quic_simple_client_bin.cc | 9 +++++++++
+ net/tools/quic/quic_simple_dispatcher.cc | 2 +-
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/net/tools/quic/quic_simple_client_bin.cc b/net/tools/quic/quic_simple_client_bin.cc
+index f14f2aa..eaf6d3b 100644
+--- a/net/tools/quic/quic_simple_client_bin.cc
++++ b/net/tools/quic/quic_simple_client_bin.cc
+@@ -65,6 +65,7 @@
+ #include "net/tools/quic/quic_simple_client.h"
+ #include "net/tools/quic/synchronous_host_resolver.h"
+ #include "url/gurl.h"
++#include "base/time/time.h"
+ 
+ using net::CertVerifier;
+ using net::CTPolicyEnforcer;
+@@ -329,7 +330,15 @@ int main(int argc, char* argv[]) {
+   client.set_store_response(true);
+ 
+   // Send the request.
++  // record time
++  int64_t start_time = (base::Time::Now() - base::Time::UnixEpoch()).InMicroseconds();
++
+   client.SendRequestAndWaitForResponse(header_block, body, /*fin=*/true);
++  int64_t now = (base::Time::Now() - base::Time::UnixEpoch()).InMicroseconds();
++
++  cout << "Number of seconds elapsed: " << (now - start_time)/1000000.0 << "\n";
++  // Set Quiet to be true for client
++  net::SetQuicFlagImpl(&FLAGS_quiet, true);
+ 
+   // Print request and response details.
+   if (!FLAGS_quiet) {
+diff --git a/net/tools/quic/quic_simple_dispatcher.cc b/net/tools/quic/quic_simple_dispatcher.cc
+index 0968292..0cc3cb3 100644
+--- a/net/tools/quic/quic_simple_dispatcher.cc
++++ b/net/tools/quic/quic_simple_dispatcher.cc
+@@ -63,7 +63,7 @@ QuicServerSessionBase* QuicSimpleDispatcher::CreateQuicSession(
+       connection_id, client_address, helper(), alarm_factory(),
+       CreatePerConnectionWriter(),
+       /* owns_writer= */ true, Perspective::IS_SERVER, GetSupportedVersions());
+-
++    QUIC_DLOG(ERROR) << "Client port: " << client_address.port();
+   if (GetQuicFlag(FLAGS_quic_reloadable_flag_quic_enable_ccp)) {
+     ccp_connection_handler_.StartFlow(connection, client_address, connection_id);
+   }
+-- 
+2.7.4
+
+
+From 581d63f621475ef0b244baebd38638d06c239526 Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Tue, 17 Jul 2018 19:31:24 +0000
+Subject: [PATCH 19/20] congestion control logger: log to a specific filename
+
+---
+ net/quic/core/quic_congestion_control_logger.cc | 8 +++++---
+ net/quic/core/quic_congestion_control_logger.h  | 2 +-
+ net/quic/core/quic_connection.cc                | 3 ++-
+ 3 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/net/quic/core/quic_congestion_control_logger.cc b/net/quic/core/quic_congestion_control_logger.cc
+index ee62fb3..e961308 100644
+--- a/net/quic/core/quic_congestion_control_logger.cc
++++ b/net/quic/core/quic_congestion_control_logger.cc
+@@ -2,24 +2,26 @@
+ 
+ #include "net/quic/core/quic_congestion_control_logger.h"
+ namespace net {
+-QuicCongestionControlLogger::QuicCongestionControlLogger(Perspective perspective, QuicSentPacketManager* sent_packet_manager, const QuicClock* clock)
++QuicCongestionControlLogger::QuicCongestionControlLogger(Perspective perspective, QuicSentPacketManager* sent_packet_manager, const QuicClock* clock, std::string file_name)
+     : perspective_(perspective),
+       sent_packet_manager_(sent_packet_manager),
+       clock_(clock),
+       stop_thread_(false),
+       logging_thread_(),
+       file_handler_(),
+-      file_name_("cwnd.txt"),
++      file_name_(file_name),
+       start_time_(clock_->WallNow()),
+       last_logged_(clock_->WallNow()) {
+         if (perspective_ == Perspective::IS_SERVER) {
+           file_handler_.open(file_name_);
++          file_handler_ << start_time_.ToUNIXSeconds() << "\n";
+           file_handler_ << "time,cwnd\n";
+         }
+       }
+ 
+ QuicCongestionControlLogger::~QuicCongestionControlLogger() {
+     if (perspective_ == Perspective::IS_SERVER) {
++        QUIC_DLOG(ERROR) << "Running close";
+         file_handler_.close();
+     }
+ }
+@@ -57,7 +59,7 @@ void QuicCongestionControlLogger::LogCwnd() {
+         uint64_t cwnd = sent_packet_manager_->GetCongestionWindowInTcpMss();
+         int64_t time_passed = TimeSince(last_logged_);
+         if (time_passed > 20 ) {
+-            int64_t time_now = Now();
++            float time_now = (float)Now()/1000;
+             file_handler_ << time_now << "," << cwnd << "\n";
+             last_logged_ = clock_->WallNow();
+         }
+diff --git a/net/quic/core/quic_congestion_control_logger.h b/net/quic/core/quic_congestion_control_logger.h
+index 075409e..bdd3324 100644
+--- a/net/quic/core/quic_congestion_control_logger.h
++++ b/net/quic/core/quic_congestion_control_logger.h
+@@ -16,7 +16,7 @@ class QuicConnection;
+ using namespace std;
+ class QuicCongestionControlLogger {
+     public:
+-        QuicCongestionControlLogger(Perspective perspective, QuicSentPacketManager* sent_packet_manager, const QuicClock* clock);
++        QuicCongestionControlLogger(Perspective perspective, QuicSentPacketManager* sent_packet_manager, const QuicClock* clock, std::string file_name);
+         ~QuicCongestionControlLogger();
+         void StartThread();
+         void StopThread();
+diff --git a/net/quic/core/quic_connection.cc b/net/quic/core/quic_connection.cc
+index 882a278..27ab876 100644
+--- a/net/quic/core/quic_connection.cc
++++ b/net/quic/core/quic_connection.cc
+@@ -322,11 +322,12 @@ QuicConnection::QuicConnection(
+       enable_server_proxy_(GetQuicReloadableFlag(quic_enable_server_proxy)),
+       use_ccp_(false),
+       ccp_close_conn_(),
+-      congestion_control_logger_(perspective, &sent_packet_manager_, helper->GetClock()) {
++      congestion_control_logger_(perspective, &sent_packet_manager_, helper->GetClock(), "cwnd_" + std::to_string(peer_address_.port()) + ".txt") {
+   QUIC_DLOG(INFO) << ENDPOINT
+                   << "Created connection with connection_id: " << connection_id
+                   << " and version: "
+                   << QuicVersionToString(transport_version());
++  QUIC_DLOG(ERROR) << "Client port: " << peer_address_.port();
+   framer_.set_visitor(this);
+   stats_.connection_creation_time = clock_->ApproximateNow();
+   // TODO(ianswett): Supply the NetworkChangeVisitor as a constructor argument
+-- 
+2.7.4
+
+
+From f65468b92c82111adfb7470f57e5a601d888dda0 Mon Sep 17 00:00:00 2001
+From: Deepti Raghavan <deeptir@mit.edu>
+Date: Tue, 17 Jul 2018 22:58:24 +0000
+Subject: [PATCH 20/20] libccp: add as submodule
+
+---
+ .gitmodules | 3 +++
+ 1 file changed, 3 insertions(+)
+ create mode 100644 .gitmodules
+
+diff --git a/.gitmodules b/.gitmodules
+new file mode 100644
+index 0000000..e1e5eef
+--- /dev/null
++++ b/.gitmodules
+@@ -0,0 +1,3 @@
++[submodule "third_party/libccp"]
++	path = third_party/libccp
++	url = https://github.com/ccp-project/libccp.git
+-- 
+2.7.4
+
