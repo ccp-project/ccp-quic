@@ -1,10 +1,16 @@
-# ccp-quic
-CCP Datapath in QUIC
+# CCP QUIC Datapath
 
-### INSTRUCTIONS for setting up and using CCP Datapath in QUIC
+This repository provides a patch for Google's implementation of QUIC that
+allows QUIC to be used as a CCP datapath.
+
+Follow the instructions below to setup this datapath, then see our
+[guide](https://ccp-project.github.io/guide) to get started using CCP.
+
+## Setup
+
 1. Follow instructions at [https://chromium.googlesource.com/chromium/src/+/master/docs/linux_build_instructions.md to build and checkout Chromium in Linux].
 
-2. After downloading and setting up Chromium, checkout commit # dedfa29047.
+2. After downloading and setting up Chromium, checkout commit hash `dedfa29047`.
 
 3. Apply the patch file here with: `git apply quic-ccp.patch`
 
